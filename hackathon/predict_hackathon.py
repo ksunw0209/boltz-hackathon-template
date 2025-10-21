@@ -5,10 +5,11 @@ import os
 import shutil
 import subprocess
 import sys
+
 from collections.abc import Iterable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from typing import Any, List, Optional, Tuple
+from typing import Any, List, Optional, Tuple, Dict
 
 import yaml
 from hackathon_api import Datapoint, Protein, SmallMolecule
@@ -20,6 +21,34 @@ sys.path.insert(0, str(src_path))
 
 from boltz.model.verifiers.openmm_energy import OpenMMInteractionEnergy
 from boltz.model.verifiers.rosetta_energy import RosettaInteractionEnergy
+from boltz.model.verifiers.interface_cdr_pct import InterfaceCDRPct
+
+# --- Robust Biopython Import ---
+try:
+    from boltz.model.verifiers.interface_cdr_pct import BIOPYTHON_AVAILABLE
+except ImportError:
+    BIOPYTHON_AVAILABLE = False
+
+if not BIOPYTHON_AVAILABLE:
+    print("Initial Biopython import failed. Attempting to add site-packages to path...")
+    # Try to find the site-packages directory of the current environment
+    # and add it to the path. This can resolve issues where the environment
+    # is not fully activated in the context of the script execution.
+    import site
+    for sp in site.getsitepackages():
+        if "site-packages" in sp:
+            print(f"Adding {sp} to sys.path")
+            sys.path.append(sp)
+            break
+    try:
+        from boltz.model.verifiers.interface_cdr_pct import BIOPYTHON_AVAILABLE
+        if BIOPYTHON_AVAILABLE:
+            print("Successfully imported Biopython after path correction.")
+    except ImportError:
+        print("Failed to import Biopython even after path correction.")
+        BIOPYTHON_AVAILABLE = False
+# -----------------------------
+
 from openmm.unit import kilojoules_per_mole
 
 # ---------------------------------------------------------------------------
@@ -66,6 +95,66 @@ def _load_confidence_scores(pdb_path: Path) -> Tuple[Optional[float], Optional[f
         print(f"  [Confidence] Exception type: {type(e).__name__}")
         print(f"  [Confidence] Exception message: {str(e)}")
         return None, None
+
+def _calculate_cdr_metrics(pdb_path: Path) -> Optional[Dict[str, float]]:
+    """
+    Calculate CDR interface metrics.
+    
+    Args:
+        pdb_path: Path to the PDB file
+        
+    Returns:
+        A dictionary with 'total_frac' and 'heavy_frac' on a 0-1 scale if successful, None otherwise
+    """
+    print(f"  [CDR Interface] Starting calculation for {pdb_path.name}")
+    
+    try:
+        if not BIOPYTHON_AVAILABLE:
+            print(f"  [CDR Interface] Biopython not available, skipping.")
+            return None
+
+        # Caching is disabled to show printouts every time
+        # pdb_name = pdb_path.stem
+        # result_file = pdb_path.parent / f"cdr_interface_{pdb_name}.json"
+        # if result_file.exists():
+        # ...
+        
+        print(f"  [CDR Interface] No cached result found, calculating...")
+        calculator = InterfaceCDRPct()
+        
+        antibody_chain_ids = ['H', 'L'] 
+        
+        results = calculator.calculate_cdr_interface_percentage(
+            pdb_file_path=str(pdb_path),
+            antibody_chain_ids=antibody_chain_ids
+        )
+        
+        total_pct = results.get('cdr_interface_pct')
+        heavy_pct = results.get('heavy_cdr_interface_pct')
+        
+        print(f"  [CDR Interface] Total Interface Percentage: {total_pct}%")
+        if heavy_pct is not None:
+            print(f"  [CDR Interface] Heavy Chain Interface Percentage: {heavy_pct}%")
+        
+        # Save results is disabled as caching is disabled
+        # print(f"  [CDR Interface] Saving results to: {result_file}")
+        # with open(result_file, 'w') as f:
+        #     json.dump(results, f, indent=2)
+        # print(f"  [CDR Interface] Results saved successfully")
+            
+        return {
+            'total_frac': total_pct / 100.0 if total_pct is not None else None,
+            'heavy_frac': heavy_pct / 100.0 if heavy_pct is not None else None,
+        }
+        
+    except Exception as e:
+        print(f"  [CDR Interface] ERROR: Exception during calculation for {pdb_path.name}")
+        print(f"  [CDR Interface] Exception type: {type(e).__name__}")
+        print(f"  [CDR Interface] Exception message: {str(e)}")
+        import traceback
+        print(f"  [CDR Interface] Full traceback:")
+        traceback.print_exc()
+        return None
 
 def _calculate_openmm_energy(pdb_path: Path) -> Optional[float]:
     """
@@ -260,6 +349,24 @@ def _calculate_all_metrics(pdb_path: Path) -> Tuple[Path, float, List[str]]:
         scores.append(-rosetta_energy)  # Negate so lower energy = higher score
         metric_names.append("rosetta_energy")
     
+    # Calculate CDR interface metrics for filtering
+    cdr_metrics = _calculate_cdr_metrics(pdb_path)
+    if cdr_metrics:
+        total_frac = cdr_metrics.get('total_frac')
+        heavy_frac = cdr_metrics.get('heavy_frac')
+        
+        # Filter out samples that have 0 contacts for total or heavy chain CDRs
+        if total_frac is not None and total_frac == 0:
+            print(f"  [Rank Filter] Total CDR interface is 0. Ranking as worst.")
+            return pdb_path, -9999.0, ["cdr_interface_total_ZERO"]
+        
+        if heavy_frac is not None and heavy_frac == 0:
+            print(f"  [Rank Filter] Heavy chain CDR interface is 0. Ranking as worst.")
+            return pdb_path, -9999.0, ["cdr_interface_heavy_ZERO"]
+
+        # The CDR metric is not added to the score, only used for filtering
+        metric_names.append("cdr_interface_FILTERED")
+    
     if not scores:
         composite_score = 0.0
     else:
@@ -303,13 +410,14 @@ def prepare_protein_complex(datapoint_id: str, proteins: List[Protein], input_di
 
     # Generate multiple configurations with different seeds (0-3)
     configs = []
-    for seed in range(4):  # seeds 0, 1, 2, 3
+    for seed in range(16):  # seeds 0, 1, 2, 3
         cli_args = [
-            "--diffusion_samples", "8", 
+            "--diffusion_samples", "4", 
             "--seed", str(seed), 
             "--use_dropout",
-            "--use_boltz1_confidence_steering",
-            "--use_boltz1_trunk_features",
+            "--no-confidence-prediction",
+            # "--use_boltz1_confidence_steering",
+            # "--use_boltz1_trunk_features",
             # "--subsample_msa",
             # "--num_subsampled_msa", "128",
         ]
@@ -379,6 +487,9 @@ def post_process_protein_complex_via_verifiers(datapoint: Datapoint, input_dicts
     2. iptm_boltz1 score from confidence JSON files (when available)
     3. OpenMM interaction energy per residue (negated, so lower energy = higher score)
     4. Rosetta interaction energy per residue (negated, so lower energy = higher score)
+    5. CDR-Antigen interface fraction (used as a filter for 0 values, not in scoring)
+    
+    Additionally, any model with a total or heavy-chain CDR interface of 0 is ranked last.
     
     Args:
         datapoint: The original datapoint object

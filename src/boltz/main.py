@@ -1118,6 +1118,11 @@ def cli() -> None:
     help="The scale of the perturbation to apply to the confidence predictions. Default is 0.25.",
     default=0.25,
 )
+@click.option(
+    "--no-confidence-prediction",
+    is_flag=True,
+    help="Whether to skip confidence prediction. Default is False.",
+)
 def predict(  # noqa: C901, PLR0915, PLR0912
     data: str,
     out_dir: str,
@@ -1171,6 +1176,7 @@ def predict(  # noqa: C901, PLR0915, PLR0912
     save_intermediate_confidence: bool = False,
     save_perturbed_confidence: bool = False,
     confidence_perturbation_scale: float = 0.25,
+    no_confidence_prediction: bool = False,
 ) -> None:
     """Run predictions with Boltz."""
     # If cpu, write a friendly warning
@@ -1500,6 +1506,7 @@ def predict(  # noqa: C901, PLR0915, PLR0912
             "msa_args": asdict(msa_args),
             "steering_args": asdict(steering_args),
             "logmd_args": asdict(logmd_args),
+            "confidence_prediction": not no_confidence_prediction,
         }
 
         if model == "boltz2":
@@ -1523,7 +1530,7 @@ def predict(  # noqa: C901, PLR0915, PLR0912
 
         model_module = model_cls.load_from_checkpoint(
             checkpoint,
-            strict=True,
+            strict=not no_confidence_prediction,
             **model_init_kwargs,
         )
         model_module.eval()

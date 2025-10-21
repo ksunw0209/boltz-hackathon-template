@@ -111,12 +111,12 @@ class BoltzWriter(BasePredictionWriter):
         pad_masks = prediction["masks"]
 
         # Get ranking
-        if "confidence_score" in prediction:
+        if "confidence_score" in prediction and prediction["confidence_score"] is not None:
             argsort = torch.argsort(prediction["confidence_score"], descending=True)
             idx_to_rank = {idx.item(): rank for rank, idx in enumerate(argsort)}
         # Handles cases where confidence summary is False
         else:
-            idx_to_rank = {i: i for i in range(len(records))}
+            idx_to_rank = {i: i for i in range(coords.shape[1])}
 
         # Iterate over the records
         for i, (record, coord, pad_mask) in enumerate(zip(records, coords, pad_masks)):

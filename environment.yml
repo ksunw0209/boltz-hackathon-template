@@ -2,12 +2,15 @@ name: boltz
 channels:
   - conda-forge
   - https://conda.rosettacommons.org
+  - bioconda
 dependencies:
   - python=3.11
   - pip
   - pymol-open-source
   - pyrosetta=2025.42
   - openmm[cuda12]
+  - abnumber
   - pdbfixer
+  - biopython
   - pip:
     - dataclasses-json
