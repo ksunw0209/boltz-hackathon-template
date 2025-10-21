@@ -3,8 +3,10 @@ from dataclasses import asdict, replace
 from pathlib import Path
 from typing import Literal
 
+import matplotlib.pyplot as plt
 import numpy as np
 import torch
+import torch.nn.functional as F
 from pytorch_lightning import LightningModule, Trainer
 from pytorch_lightning.callbacks import BasePredictionWriter
 from torch import Tensor
@@ -22,8 +24,7 @@ class BoltzWriter(BasePredictionWriter):
         data_dir: str,
         output_dir: str,
         output_format: Literal["pdb", "mmcif"] = "mmcif",
-        boltz2: bool = False,
-        write_embeddings: bool = False,
+        boltz2: bool = False
     ) -> None:
         """Initialize the writer.
 
@@ -44,7 +45,46 @@ class BoltzWriter(BasePredictionWriter):
         self.failed = 0
         self.boltz2 = boltz2
         self.output_dir.mkdir(parents=True, exist_ok=True)
-        self.write_embeddings = write_embeddings
+
+    def _get_cb_coords(self, atoms, coords):
+        def _np_norm(x, axis=-1, keepdims=True, eps=1e-8):
+            """compute norm of vector"""
+            return np.sqrt(np.square(x).sum(axis, keepdims=keepdims) + eps)
+
+        def _np_extend(a,b,c, L,A,D):
+                normalize = lambda x: x/_np_norm(x)
+                bc = normalize(b-c)
+                n = normalize(np.cross(b-a, bc))
+                return c + sum([L * np.cos(A) * bc,
+                                L * np.sin(A) * np.cos(D) * np.cross(n, bc),
+                                L * np.sin(A) * np.sin(D) * -n])
+
+        def _np_get_cb(N,CA,C):
+                return _np_extend(C, N, CA, 1.522, 1.927, -2.143)
+
+        def get_special_atom_positions(atoms, special_atom):
+            positions = []
+            for i, atom in enumerate(atoms):
+                if self.boltz2:
+                    name = str(atom["name"])
+                else:
+                    name = atom["name"]
+                    name = [chr(c + 32) for c in name if c != 0]
+                    name = "".join(name)
+                if name == special_atom:
+                    positions.append(i)
+            return positions
+
+        CA_positions = get_special_atom_positions(atoms, 'CA')
+        C_positions = get_special_atom_positions(atoms, 'C')
+        N_positions = get_special_atom_positions(atoms, 'N')
+
+        coords_CA = coords[CA_positions, :]  
+        coords_C = coords[C_positions, :]
+        coords_N = coords[N_positions, :]
+        coords_CB = _np_get_cb(coords_N, coords_CA, coords_C)
+
+        return coords_CB
 
     def write_on_batch_end(
         self,
@@ -79,7 +119,7 @@ class BoltzWriter(BasePredictionWriter):
             idx_to_rank = {i: i for i in range(len(records))}
 
         # Iterate over the records
-        for record, coord, pad_mask in zip(records, coords, pad_masks):
+        for i, (record, coord, pad_mask) in enumerate(zip(records, coords, pad_masks)):
             # Load the structure
             path = self.data_dir / f"{record.id}.npz"
             if self.boltz2:
@@ -87,20 +127,52 @@ class BoltzWriter(BasePredictionWriter):
             else:
                 structure: Structure = Structure.load(path)
 
+            # Save the structure
+            struct_dir = self.output_dir / record.id
+            struct_dir.mkdir(exist_ok=True)
+
             # Compute chain map with masked removed, to be used later
             chain_map = {}
-            for i, mask in enumerate(structure.mask):
+            for j, mask in enumerate(structure.mask):
                 if mask:
-                    chain_map[len(chain_map)] = i
+                    chain_map[len(chain_map)] = j
 
             # Remove masked chains completely
             structure = structure.remove_invalid_chains()
+
+            if "pdistogram" in prediction:
+                pdistogram_logits = prediction["pdistogram"][i]
+
+                num_bins = 64
+                mid_points = torch.linspace(2, 22, num_bins).to(pdistogram_logits.device)
+                boundaries = torch.linspace(2, 22, num_bins - 1).to(pdistogram_logits.device)
+                cutoff = 8.0
+                bins = mid_points < cutoff
+                
+                len_a = structure.chains[0]["res_num"]
+                len_b = structure.chains[1]["res_num"]
+                
+                px = torch.sum(
+                    torch.softmax(pdistogram_logits, dim=-1)[:, :, ..., bins], dim=-1
+                )
+                if px.ndim == 3:
+                    px = px.squeeze(-1)
+
+                np.savez_compressed(
+                    struct_dir / f"pdistogram_logits_{record.id}.npz",
+                    pdistogram=pdistogram_logits.cpu().float().numpy(),
+                )
+
+                np.savez_compressed(
+                    self.output_dir / f"contact_px_{record.id}.npz",
+                    px=px.cpu().float().numpy(),
+                )
 
             for model_idx in range(coord.shape[0]):
                 # Get model coord
                 model_coord = coord[model_idx]
                 # Unpad
-                coord_unpad = model_coord[pad_mask.bool()]
+                coord_unpad = model_coord[pad_mask.bool().to(model_coord.device)]
                 coord_unpad = coord_unpad.cpu().numpy()
 
                 # New atom table
@@ -146,10 +218,6 @@ class BoltzWriter(BasePredictionWriter):
                     )
                     chain_info.append(new_chain_info)
 
-                # Save the structure
-                struct_dir = self.output_dir / record.id
-                struct_dir.mkdir(exist_ok=True)
-
                 # Get plddt's
                 plddts = None
                 if "plddt" in prediction:
@@ -181,23 +249,36 @@ class BoltzWriter(BasePredictionWriter):
                     np.array(atoms["coords"][:, None], dtype=Coords)
 
                 # Save confidence summary
+                confidence_keys = [
+                    "ptm",
+                    "iptm",
+                    "ligand_iptm",
+                    "protein_iptm",
+                    # "ptm_energy",  # Not returned by confidence_v2.py
+                    # "iptm_energy",  # Not returned by confidence_v2.py
+                    "complex_plddt",
+                    "complex_iplddt",
+                    "complex_pde",
+                    "complex_ipde",
+                    "ptm_boltz1",
+                    "iptm_boltz1",
+                    "ligand_iptm_boltz1",
+                    "protein_iptm_boltz1",
+                    # "ptm_energy_boltz1",  # Not returned by confidence_v2.py
+                    # "iptm_energy_boltz1",  # Not returned by confidence_v2.py
+                    "complex_plddt_boltz1",
+                    "complex_iplddt_boltz1",
+                    "complex_pde_boltz1",
+                    "complex_ipde_boltz1",
+                ]
+                confidence_keys = [key for key in confidence_keys if key in prediction]
                 if "plddt" in prediction:
                     path = (
                         struct_dir
                         / f"confidence_{record.id}_model_{idx_to_rank[model_idx]}.json"
                     )
                     confidence_summary_dict = {}
-                    for key in [
-                        "confidence_score",
-                        "ptm",
-                        "iptm",
-                        "ligand_iptm",
-                        "protein_iptm",
-                        "complex_plddt",
-                        "complex_iplddt",
-                        "complex_pde",
-                        "complex_ipde",
-                    ]:
+                    for key in confidence_keys:
                         confidence_summary_dict[key] = prediction[key][model_idx].item()
                     confidence_summary_dict["chains_ptm"] = {
                         idx: prediction["pair_chains_iptm"][idx][idx][model_idx].item()
@@ -212,6 +293,53 @@ class BoltzWriter(BasePredictionWriter):
                         }
                         for idx1 in prediction["pair_chains_iptm"]
                     }
+                    if "pair_chains_iptm_boltz1" in prediction:
+                        confidence_summary_dict["chains_ptm_boltz1"] = {
+                            idx: prediction["pair_chains_iptm_boltz1"][idx][idx][model_idx].item()
+                            for idx in prediction["pair_chains_iptm_boltz1"]
+                        }
+                        confidence_summary_dict["pair_chains_iptm_boltz1"] = {
+                            idx1: {
+                                idx2: prediction["pair_chains_iptm_boltz1"][idx1][idx2][
+                                    model_idx
+                                ].item()
+                                for idx2 in prediction["pair_chains_iptm_boltz1"][idx1]
+                            }
+                            for idx1 in prediction["pair_chains_iptm_boltz1"]
+                        }
+
+                    # Save ablation results
+                    ablation_prefixes = [
+                        "ablation_pd_gtc_",
+                        "ablation_gtd_pc_",
+                        "ablation_gtd_gtc_",
+                    ]
+                    for prefix in ablation_prefixes:
+                        if f"{prefix}plddt" in prediction:
+                            for key in confidence_keys:
+                                full_key = f"{prefix}{key}"
+                                if full_key in prediction:
+                                    confidence_summary_dict[full_key] = prediction[
+                                        full_key
+                                    ][model_idx].item()
+                            
+                            # pair_chains_iptm
+                            pair_chains_key = f"{prefix}pair_chains_iptm"
+                            if pair_chains_key in prediction:
+                                confidence_summary_dict[f"{prefix}chains_ptm"] = {
+                                    idx: prediction[pair_chains_key][idx][idx][model_idx].item()
+                                    for idx in prediction[pair_chains_key]
+                                }
+                                confidence_summary_dict[pair_chains_key] = {
+                                    idx1: {
+                                        idx2: prediction[pair_chains_key][idx1][idx2][
+                                            model_idx
+                                        ].item()
+                                        for idx2 in prediction[pair_chains_key][idx1]
+                                    }
+                                    for idx1 in prediction[pair_chains_key]
+                                }
+
                     with path.open("w") as f:
                         f.write(
                             json.dumps(
@@ -245,17 +373,6 @@ class BoltzWriter(BasePredictionWriter):
                         / f"pde_{record.id}_model_{idx_to_rank[model_idx]}.npz"
                     )
                     np.savez_compressed(path, pde=pde.cpu().numpy())
-                
-            # Save embeddings
-            if self.write_embeddings and "s" in prediction and "z" in prediction:
-                s = prediction["s"].cpu().numpy()
-                z = prediction["z"].cpu().numpy()
-
-                path = (
-                    struct_dir
-                    / f"embeddings_{record.id}.npz"
-                )
-                np.savez_compressed(path, s=s, z=z)
 
     def on_predict_epoch_end(
         self,

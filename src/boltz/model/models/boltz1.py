@@ -2,6 +2,7 @@ import gc
 import random
 from typing import Any, Optional
 
+import numpy as np
 import torch
 import torch._dynamo
 from pytorch_lightning import LightningModule
@@ -76,7 +77,9 @@ class Boltz1(LightningModule):
         max_dist: float = 22.0,
         predict_args: Optional[dict[str, Any]] = None,
         steering_args: Optional[dict[str, Any]] = None,
+        logmd_args: Optional[dict[str, Any]] = None,
         use_kernels: bool = False,
+        boltz2_checkpoint: Optional[str] = None,
     ) -> None:
         super().__init__()
 
@@ -139,6 +142,7 @@ class Boltz1(LightningModule):
         self.diffusion_loss_args = diffusion_loss_args
         self.predict_args = predict_args
         self.steering_args = steering_args
+        self.logmd_args = logmd_args
 
         self.use_kernels = use_kernels
 
@@ -261,26 +265,41 @@ class Boltz1(LightningModule):
                 if name.split(".")[0] != "confidence_module":
                     param.requires_grad = False
 
-    def setup(self, stage: str) -> None:
-        """Set the model for training, validation and inference."""
-        if stage == "predict" and not (
-            torch.cuda.is_available()
-            and torch.cuda.get_device_properties(torch.device("cuda")).major >= 8.0  # noqa: PLR2004
-        ):
-            self.use_kernels = False
+        if self.steering_args and self.steering_args.get("use_boltz2_confidence_steering", False):
+            assert (
+                boltz2_checkpoint is not None
+            ), "boltz2_checkpoint must be provided for confidence steering"
+            print("Loading boltz2 model for confidence steering")
+            from boltz.model.models.boltz2 import Boltz2
+            from boltz.main import PairformerArgsV2
+            from dataclasses import asdict
 
-    def forward(
-        self,
-        feats: dict[str, Tensor],
-        recycling_steps: int = 0,
-        num_sampling_steps: Optional[int] = None,
-        multiplicity_diffusion_train: int = 1,
-        diffusion_samples: int = 1,
-        max_parallel_samples: Optional[int] = None,
-        run_confidence_sequentially: bool = False,
-    ) -> dict[str, Tensor]:
-        dict_out = {}
+            self.boltz2_model_container = [
+                Boltz2.load_from_checkpoint(
+                    boltz2_checkpoint,
+                    map_location="cpu",
+                    strict=True,
+                    pairformer_args=asdict(PairformerArgsV2()),
+                ).eval()
+            ]
+            for param in self.boltz2_model_container[0].parameters():
+                    param.requires_grad = False
+            
+            if not self.steering_args.get("use_boltz2_trunk_features", False):
+                boltz2_model = self.boltz2_model_container[0]
+                for attr_name in [
+                    "input_embedder", "rel_pos", "token_bonds", "s_init", "z_init_1", "z_init_2",
+                    "s_norm", "z_norm", "s_recycle", "z_recycle", "msa_module", "pairformer_module", 
+                    "structure_module", "distogram_module", "contact_conditioning", "template_module", 
+                    "diffusion_conditioning", "bfactor_module"
+                ]:
+                    if hasattr(boltz2_model, attr_name):
+                        delattr(boltz2_model, attr_name)
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
 
+    def trunk_forward(self, feats: dict[str, Tensor], recycling_steps: int = 0) -> tuple[Tensor, Tensor, Tensor, dict[str, Tensor]]:
         # Compute input embeddings
         with torch.set_grad_enabled(
             self.training and self.structure_prediction_training
@@ -340,11 +359,21 @@ class Boltz1(LightningModule):
                     )
 
             pdistogram = self.distogram_module(z)
-            dict_out = {
-                "pdistogram": pdistogram,
-                "s": s,
-                "z": z,
-            }
+            dict_out = {"pdistogram": pdistogram}
+
+        return s_inputs, s, z, relative_position_encoding, dict_out
+
+    def forward(
+        self,
+        feats: dict[str, Tensor],
+        recycling_steps: int = 0,
+        num_sampling_steps: Optional[int] = None,
+        multiplicity_diffusion_train: int = 1,
+        diffusion_samples: int = 1,
+        max_parallel_samples: Optional[int] = None,
+        run_confidence_sequentially: bool = False,
+    ) -> dict[str, Tensor]:
+        s_inputs, s, z, relative_position_encoding, dict_out = self.trunk_forward(feats, recycling_steps)
 
         # Compute structure module
         if self.training and self.structure_prediction_training:
@@ -360,6 +389,36 @@ class Boltz1(LightningModule):
             )
 
         if (not self.training) or self.confidence_prediction:
+            if self.steering_args["use_confidence"] or (
+                self.logmd_args and self.logmd_args.get("save_intermediate_confidence")
+            ):
+                confidence_kwargs = {
+                    "confidence_module": self.confidence_module,
+                    "pred_distogram_logits": dict_out["pdistogram"].detach(),
+                    "run_sequentially": run_confidence_sequentially,
+                }
+                if self.steering_args.get("use_boltz2_confidence_steering", False):
+                    b2_model = self.boltz2_model_container[0]
+                    b2_model.to(z.device)
+                    b2_model = b2_model.to(dtype=self.dtype)
+                    if self.steering_args.get("use_boltz2_trunk_features", False):
+                        s_inputs_b2, s_b2, z_b2, _ = b2_model.trunk_forward(
+                            feats["boltz2_feats"], recycling_steps
+                        )
+                        confidence_kwargs["boltz2_trunk_features"] = {
+                            "s_inputs": s_inputs_b2.to(self.dtype),
+                            "s": s_b2.to(self.dtype),
+                            "z": z_b2.to(self.dtype),
+                        }
+                        b2_model.to("cpu")
+                        torch.cuda.empty_cache()
+
+                    boltz2_conf_mod = b2_model.confidence_module
+                    if next(boltz2_conf_mod.parameters()).device != z.device:
+                        boltz2_conf_mod.to(z.device)
+                    confidence_kwargs["boltz2_confidence_module"] = boltz2_conf_mod
+            else:
+                confidence_kwargs = None
             dict_out.update(
                 self.structure_module.sample(
                     s_trunk=s,
@@ -373,6 +432,8 @@ class Boltz1(LightningModule):
                     max_parallel_samples=max_parallel_samples,
                     train_accumulate_token_repr=self.training,
                     steering_args=self.steering_args,
+                    confidence_kwargs=confidence_kwargs,
+                    logmd_args=self.logmd_args,
                 )
             )
 
@@ -1163,8 +1224,8 @@ class Boltz1(LightningModule):
             pred_dict = {"exception": False}
             pred_dict["masks"] = batch["atom_pad_mask"]
             pred_dict["coords"] = out["sample_atom_coords"]
-            pred_dict["s"] = out["s"]
-            pred_dict["z"] = out["z"]
+            if "pdistogram" in out:
+                pred_dict["pdistogram"] = out["pdistogram"]
             if self.predict_args.get("write_confidence_summary", True):
                 pred_dict["confidence_score"] = (
                     4 * out["complex_plddt"]

@@ -10,9 +10,11 @@ from torch.utils.data import DataLoader
 
 from boltz.data import const
 from boltz.data.crop.affinity import AffinityCropper
+from boltz.data.feature.featurizer import BoltzFeaturizer
 from boltz.data.feature.featurizerv2 import Boltz2Featurizer
 from boltz.data.mol import load_canonicals, load_molecules
 from boltz.data.pad import pad_to_max
+from boltz.data.tokenize.boltz import BoltzTokenizer
 from boltz.data.tokenize.boltz2 import Boltz2Tokenizer
 from boltz.data.types import (
     MSA,
@@ -128,6 +130,13 @@ def collate(data: list[dict[str, Tensor]]) -> dict[str, Tensor]:
 
     # Collate the data
     collated = {}
+    if "boltz1_feats" in keys:
+        from boltz.data.module.inference import collate as collate_boltz1
+        boltz1_feats = [d.pop("boltz1_feats") for d in data]
+        collated["boltz1_feats"] = collate_boltz1(boltz1_feats)
+
+    # Get remaining keys after popping
+    keys = data[0].keys()
     for key in keys:
         values = [d[key] for d in data]
 
@@ -168,6 +177,8 @@ class PredictionDataset(torch.utils.data.Dataset):
         extra_mols_dir: Optional[Path] = None,
         override_method: Optional[str] = None,
         affinity: bool = False,
+        use_boltz1_confidence_steering: bool = False,
+        boltz1_target_dir: Optional[Path] = None,
     ) -> None:
         """Initialize the training dataset.
 
@@ -200,8 +211,13 @@ class PredictionDataset(torch.utils.data.Dataset):
         self.extra_mols_dir = extra_mols_dir
         self.override_method = override_method
         self.affinity = affinity
+        self.use_boltz1_confidence_steering = use_boltz1_confidence_steering
+        self.boltz1_target_dir = boltz1_target_dir
         if self.affinity:
             self.cropper = AffinityCropper()
+        if self.use_boltz1_confidence_steering:
+            self.boltz1_tokenizer = BoltzTokenizer()
+            self.boltz1_featurizer = BoltzFeaturizer()
 
     def __getitem__(self, idx: int) -> dict:
         """Get an item from the dataset.
@@ -261,12 +277,9 @@ class PredictionDataset(torch.utils.data.Dataset):
         # Inference specific options
         options = record.inference_options
         if options is None:
-            pocket_constraints, contact_constraints = None, None
+            pocket_constraints = None, None
         else:
-            pocket_constraints, contact_constraints = (
-                options.pocket_constraints,
-                options.contact_constraints,
-            )
+            pocket_constraints = options.pocket_constraints
 
         # Get random seed
         seed = 42
@@ -286,11 +299,27 @@ class PredictionDataset(torch.utils.data.Dataset):
                 single_sequence_prop=0.0,
                 compute_frames=True,
                 inference_pocket_constraints=pocket_constraints,
-                inference_contact_constraints=contact_constraints,
                 compute_constraint_features=True,
                 override_method=self.override_method,
                 compute_affinity=self.affinity,
             )
+            if self.use_boltz1_confidence_steering:
+                from boltz.data.module.inference import load_input as load_input_v1
+                input_data_v1 = load_input_v1(
+                    record=record,
+                    target_dir=self.boltz1_target_dir,
+                    msa_dir=self.msa_dir,
+                    constraints_dir=self.constraints_dir,
+                )
+                tokenized_v1 = self.boltz1_tokenizer.tokenize(input_data_v1)
+                boltz1_features = self.boltz1_featurizer.process(
+                    tokenized_v1,
+                    training=False,
+                    max_seqs=const.max_msa_seqs,
+                    atoms_per_window_queries=32,
+                )
+                features["boltz1_feats"] = boltz1_features
+
         except Exception as e:  # noqa: BLE001
             import traceback
 
@@ -329,6 +358,8 @@ class Boltz2InferenceDataModule(pl.LightningDataModule):
         extra_mols_dir: Optional[Path] = None,
         override_method: Optional[str] = None,
         affinity: bool = False,
+        use_boltz1_confidence_steering: bool = False,
+        boltz1_target_dir: Optional[Path] = None,
     ) -> None:
         """Initialize the DataModule.
 
@@ -365,6 +396,8 @@ class Boltz2InferenceDataModule(pl.LightningDataModule):
         self.extra_mols_dir = extra_mols_dir
         self.override_method = override_method
         self.affinity = affinity
+        self.use_boltz1_confidence_steering = use_boltz1_confidence_steering
+        self.boltz1_target_dir = boltz1_target_dir
 
     def predict_dataloader(self) -> DataLoader:
         """Get the training dataloader.
@@ -385,6 +418,8 @@ class Boltz2InferenceDataModule(pl.LightningDataModule):
             extra_mols_dir=self.extra_mols_dir,
             override_method=self.override_method,
             affinity=self.affinity,
+            use_boltz1_confidence_steering=self.use_boltz1_confidence_steering,
+            boltz1_target_dir=self.boltz1_target_dir,
         )
         return DataLoader(
             dataset,
@@ -429,5 +464,10 @@ class Boltz2InferenceDataModule(pl.LightningDataModule):
                 "record",
                 "affinity_mw",
             ]:
-                batch[key] = batch[key].to(device)
+                if key == "boltz1_feats":
+                    for k1, v1 in batch[key].items():
+                        if hasattr(v1, "to"):
+                            batch[key][k1] = v1.to(device)
+                else:
+                    batch[key] = batch[key].to(device)
         return batch

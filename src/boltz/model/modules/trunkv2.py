@@ -570,6 +570,7 @@ class MSAModule(nn.Module):
         emb: Tensor,
         feats: dict[str, Tensor],
         use_kernels: bool = False,
+        use_dropout: bool = False,
     ) -> Tensor:
         """Perform the forward pass.
 
@@ -582,7 +583,7 @@ class MSAModule(nn.Module):
         feats : dict[str, Tensor]
             Input features
         use_kernels: bool
-            Whether to use kernels for triangular updates
+            Whether to use trifast for triangular updates
 
         Returns
         -------
@@ -651,7 +652,8 @@ class MSAModule(nn.Module):
                     chunk_size_transition_msa,
                     chunk_size_outer_product,
                     chunk_size_tri_attn,
-                    use_kernels,
+                    use_kernels=use_kernels,
+                    use_dropout=use_dropout,
                 )
             else:
                 z, m = self.layers[i](
@@ -664,7 +666,8 @@ class MSAModule(nn.Module):
                     chunk_size_transition_msa,
                     chunk_size_outer_product,
                     chunk_size_tri_attn,
-                    use_kernels,
+                    use_kernels=use_kernels,
+                    use_dropout=use_dropout,
                 )
         return z
 
@@ -723,6 +726,7 @@ class MSALayer(nn.Module):
         chunk_size_outer_product: int = None,
         chunk_size_tri_attn: int = None,
         use_kernels: bool = False,
+        use_dropout: bool = False,
     ) -> tuple[Tensor, Tensor]:
         """Perform the forward pass.
 
@@ -742,7 +746,7 @@ class MSALayer(nn.Module):
 
         """
         # Communication to MSA stack
-        msa_dropout = get_dropout_mask(self.msa_dropout, m, self.training)
+        msa_dropout = get_dropout_mask(self.msa_dropout, m, self.training or use_dropout)
         m = m + msa_dropout * self.pair_weighted_averaging(
             m, z, token_mask, chunk_heads_pwa
         )
@@ -752,7 +756,7 @@ class MSALayer(nn.Module):
 
         # Compute pairwise stack
         z = self.pairformer_layer(
-            z, token_mask, chunk_size_tri_attn, use_kernels=use_kernels
+            z, token_mask, chunk_size_tri_attn, use_kernels=use_kernels, use_dropout=use_dropout
         )
 
         return z, m

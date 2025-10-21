@@ -1,9 +1,11 @@
 import gc
 from typing import Any, Optional
+import math
 
 import numpy as np
 import torch
 import torch._dynamo
+import torch.nn.functional as F
 from pytorch_lightning import Callback, LightningModule
 from torch import Tensor, nn
 from torchmetrics import MeanMetric
@@ -21,6 +23,7 @@ from boltz.model.loss.confidencev2 import (
 from boltz.model.loss.distogramv2 import distogram_loss
 from boltz.model.modules.affinity import AffinityModule
 from boltz.model.modules.confidencev2 import ConfidenceModule
+from boltz.model.modules.confidence import ConfidenceModule as ConfidenceModuleV1
 from boltz.model.modules.diffusion_conditioning import DiffusionConditioning
 from boltz.model.modules.diffusionv2 import AtomDiffusion
 from boltz.model.modules.encodersv2 import RelativePositionEncoder
@@ -35,6 +38,7 @@ from boltz.model.modules.trunkv2 import (
 )
 from boltz.model.optim.ema import EMA
 from boltz.model.optim.scheduler import AlphaFoldLRScheduler
+from boltz.model.models.boltz1 import Boltz1
 
 
 class Boltz2(LightningModule):
@@ -97,6 +101,7 @@ class Boltz2(LightningModule):
         conditioning_cutoff_min: float = 4.0,
         conditioning_cutoff_max: float = 20.0,
         steering_args: Optional[dict] = None,
+        logmd_args: Optional[dict] = None,
         use_templates: bool = False,
         compile_templates: bool = False,
         predict_bfactor: bool = False,
@@ -104,9 +109,14 @@ class Boltz2(LightningModule):
         checkpoint_diffusion_conditioning: bool = False,
         use_templates_v2: bool = False,
         use_kernels: bool = False,
+        use_dropout: bool = False,
+        boltz1_checkpoint: Optional[str] = None,
     ) -> None:
         super().__init__()
         self.save_hyperparameters(ignore=["validators"])
+
+        # Flag to disable state changes when using DataParallel
+        self.is_in_dataparallel = False
 
         # No random recycling
         self.no_random_recycling_training = no_random_recycling_training
@@ -133,7 +143,7 @@ class Boltz2(LightningModule):
         self.diffusion_loss_args = diffusion_loss_args
         self.predict_args = predict_args
         self.steering_args = steering_args
-
+        self.logmd_args = logmd_args
         # Training metrics
         if validate_structure:
             self.train_confidence_loss_logger = MeanMetric()
@@ -159,8 +169,9 @@ class Boltz2(LightningModule):
         self.is_msa_compiled = False
         self.is_template_compiled = False
 
-        # Kernels
+        # Trifast
         self.use_kernels = use_kernels
+        self.use_dropout = use_dropout
 
         # Input embeddings
         full_embedder_args = {
@@ -271,25 +282,6 @@ class Boltz2(LightningModule):
             use_residue_feats_atoms=use_residue_feats_atoms,
         )
 
-        # Output modules
-        self.structure_module = AtomDiffusion(
-            score_model_args={
-                "token_s": token_s,
-                "atom_s": atom_s,
-                "atoms_per_window_queries": atoms_per_window_queries,
-                "atoms_per_window_keys": atoms_per_window_keys,
-                **score_model_args,
-            },
-            compile_score=compile_structure,
-            **diffusion_process_args,
-        )
-        self.distogram_module = DistogramModule(
-            token_z,
-            num_bins,
-        )
-        self.predict_bfactor = predict_bfactor
-        if predict_bfactor:
-            self.bfactor_module = BFactorModule(token_s, num_bins)
 
         self.confidence_prediction = confidence_prediction
         self.affinity_prediction = affinity_prediction
@@ -317,6 +309,76 @@ class Boltz2(LightningModule):
                 self.confidence_module = torch.compile(
                     self.confidence_module, dynamic=False, fullgraph=False
                 )
+        
+        if self.steering_args and self.steering_args.get("use_boltz1_confidence_steering", False):
+            assert (
+                boltz1_checkpoint is not None
+            ), "boltz1_checkpoint must be provided for confidence steering"
+            print("Loading boltz1 model for confidence steering")
+            # Restore Boltz1 directly from checkpoint to avoid constructor arg mismatches            
+            self.boltz1_model_container = [
+                Boltz1.load_from_checkpoint(
+                    boltz1_checkpoint,
+                    map_location="cpu",
+                    strict=True,
+                ).eval()
+            ]
+            for param in self.boltz1_model_container[0].parameters():
+                param.requires_grad = False
+
+            # Optionally keep trunk for features; otherwise prune heavy modules to save memory
+            if not self.steering_args.get("use_boltz1_trunk_features", False):
+                boltz1_model = self.boltz1_model_container[0]
+                for attr_name in [
+                    "input_embedder",
+                    "rel_pos",
+                    "token_bonds",
+                    "s_init",
+                    "z_init_1",
+                    "z_init_2",
+                    "s_norm",
+                    "z_norm",
+                    "s_recycle",
+                    "z_recycle",
+                    "msa_module",
+                    "pairformer_module",
+                    "structure_module",
+                    "distogram_module",
+                ]:
+                    if hasattr(boltz1_model, attr_name):
+                        delattr(boltz1_model, attr_name)
+                # Encourage freeing unused memory
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+
+            print("Finished loading boltz1 model for confidence steering")
+
+        # Output modules
+        use_accumulate_token_repr = False # (
+        #     self.steering_args.get("use_boltz1_confidence_steering", False)
+        #     and self.boltz1_model_container[0].confidence_module.use_s_diffusion
+        # )
+        diffusion_process_args.pop("mse_rotational_alignment", None)
+        self.structure_module = AtomDiffusion(
+            score_model_args={
+                "token_s": token_s,
+                "atom_s": atom_s,
+                "atoms_per_window_queries": atoms_per_window_queries,
+                "atoms_per_window_keys": atoms_per_window_keys,
+                **score_model_args,
+            },
+            compile_score=compile_structure,
+            accumulate_token_repr=use_accumulate_token_repr,
+            **diffusion_process_args,
+        )
+        self.distogram_module = DistogramModule(
+            token_z,
+            num_bins,
+        )
+        self.predict_bfactor = predict_bfactor
+        if predict_bfactor:
+            self.bfactor_module = BFactorModule(token_s, num_bins)
 
         if self.affinity_prediction:
             if self.affinity_ensemble:
@@ -358,13 +420,7 @@ class Boltz2(LightningModule):
                     param.requires_grad = False
 
     def setup(self, stage: str) -> None:
-        """Set the model for training, validation and inference."""
-        if stage == "predict" and not (
-            torch.cuda.is_available()
-            and torch.cuda.get_device_properties(torch.device("cuda")).major >= 8.0  # noqa: PLR2004
-        ):
-            self.use_kernels = False
-
+        """Set the model for training, validation."""
         if (
             stage != "predict"
             and hasattr(self.trainer, "datamodule")
@@ -402,111 +458,206 @@ class Boltz2(LightningModule):
         self,
         feats: dict[str, Tensor],
         recycling_steps: int = 0,
+        s_z_samples: int = 1,
         num_sampling_steps: Optional[int] = None,
         multiplicity_diffusion_train: int = 1,
         diffusion_samples: int = 1,
         max_parallel_samples: Optional[int] = None,
+        max_multiplicity: Optional[int] = None,
         run_confidence_sequentially: bool = False,
     ) -> dict[str, Tensor]:
-        with torch.set_grad_enabled(
-            self.training and self.structure_prediction_training
-        ):
-            s_inputs = self.input_embedder(feats)
+        print(feats["record"][0].id)
 
-            # Initialize the sequence embeddings
-            s_init = self.s_init(s_inputs)
-
-            # Initialize pairwise embeddings
-            z_init = (
-                self.z_init_1(s_inputs)[:, :, None]
-                + self.z_init_2(s_inputs)[:, None, :]
+        s_list = []
+        z_list = []
+        for i in range(s_z_samples):
+            print("s_z_sample", i)
+            s_inputs, s, z, relative_position_encoding = self.trunk_forward(
+                feats=feats,
+                recycling_steps=recycling_steps,
             )
-            relative_position_encoding = self.rel_pos(feats)
-            z_init = z_init + relative_position_encoding
-            z_init = z_init + self.token_bonds(feats["token_bonds"].float())
-            if self.bond_type_feature:
-                z_init = z_init + self.token_bonds_type(feats["type_bonds"].long())
-            z_init = z_init + self.contact_conditioning(feats)
+            s_list.append(s.detach().clone().float())
+            z_list.append(z.detach().clone().float())
 
-            # Perform rounds of the pairwise stack
-            s = torch.zeros_like(s_init)
-            z = torch.zeros_like(z_init)
+        # Offload pairformer module to CPU to save GPU memory
+        if not self.training and s_z_samples > 1:
+            self.pairformer_module = self.pairformer_module.cpu()
+            torch.cuda.empty_cache()
 
-            # Compute pairwise mask
-            mask = feats["token_pad_mask"].float()
-            pair_mask = mask[:, :, None] * mask[:, None, :]
-            if self.run_trunk_and_structure:
-                for i in range(recycling_steps + 1):
-                    with torch.set_grad_enabled(
-                        self.training
-                        and self.structure_prediction_training
-                        and (i == recycling_steps)
-                    ):
-                        # Issue with unused parameters in autocast
-                        if (
-                            self.training
-                            and (i == recycling_steps)
-                            and torch.is_autocast_enabled()
-                        ):
-                            torch.clear_autocast_cache()
+        pdistogram_list = []
+        for z in z_list:
+            pdistogram_list.append(self.distogram_module(z))
+        pdistogram = torch.cat(pdistogram_list, dim=3) # Treat different samples as different conformers
+        dict_out = {"pdistogram": pdistogram}
 
-                        # Apply recycling
-                        s = s_init + self.s_recycle(self.s_norm(s))
-                        z = z_init + self.z_recycle(self.z_norm(z))
+        if (
+            (self.predict_args.get("structure_ablation", False) or self.predict_args.get("confidence_ablation", False))
+            and not self.training
+        ):
+            assert s_z_samples == 1, "Structure ablation only supports 1 sample"
 
-                        # Compute pairwise stack
-                        if self.use_templates:
-                            if self.is_template_compiled and not self.training:
-                                template_module = self.template_module._orig_mod  # noqa: SLF001
-                            else:
-                                template_module = self.template_module
+            # Predicted distogram
+            pred_distogram_logits = dict_out["pdistogram"][:, :, :, 0].detach()
+            pred_logits_min = pred_distogram_logits.min()
+            pred_logits_max = pred_distogram_logits.max()
+            print("pred_distogram_logits", torch.sum(torch.argmax(pred_distogram_logits, dim=-1)))
+            print("pred_distogram_logits", pred_distogram_logits)
+            print("pred_distogram_logits mean", pred_distogram_logits.mean())
 
-                            z = z + template_module(
-                                z, feats, pair_mask, use_kernels=self.use_kernels
-                            )
+            # Aggregate distogram over K conformers
+            assert len(feats["disto_target"].shape) == 5
+            print(feats["disto_target"].shape)
+            disto_target = feats["disto_target"].sum(dim=3).detach()  # (1, L, L, n_bins)
+            
+            '''
+            disto_target_logits = torch.where(disto_target == 1., pred_logits_max, pred_logits_min)
+            disto_target = torch.argmax(disto_target_logits, dim=-1)
+            gt_z = self.confidence_module.dist_bin_pairwise_embed(disto_target)
 
-                        if self.is_msa_compiled and not self.training:
-                            msa_module = self.msa_module._orig_mod  # noqa: SLF001
-                        else:
-                            msa_module = self.msa_module
+            '''
 
-                        z = z + msa_module(
-                            z, s_inputs, feats, use_kernels=self.use_kernels
-                        )
+            # Get peak indices and adjacent bins
+            # peak_indices = torch.argmax(pred_distogram_logits, dim=-1)  # B x L x L
+            # num_bins = pred_distogram_logits.shape[-1]
+        
+            # # Get indices of adjacent bins (-2, -1, 0, +1, +2 relative to peak)
+            # indices_offset = torch.tensor([-2, -1, 0, 1, 2], device=peak_indices.device)
+            # peak_and_adjacent = peak_indices[..., None] + indices_offset[None, None, None, :]
+            # peak_and_adjacent = torch.clamp(peak_and_adjacent, min=0, max=num_bins-1)
+        
+            # # Get the logit values at these indices
+            # B, L1, L2 = pred_distogram_logits.shape[:3]
+            # batch_indices = torch.arange(B).view(-1, 1, 1, 1).expand(-1, L1, L2, 5)
+            # row_indices = torch.arange(L1).view(1, -1, 1, 1).expand(B, -1, L2, 5)
+            # col_indices = torch.arange(L2).view(1, 1, -1, 1).expand(B, L1, -1, 5)
+        
+            # peak_logit_values = pred_distogram_logits[batch_indices, row_indices, col_indices, peak_and_adjacent]
+            # print("Logit values at [peak-2, peak-1, peak, peak+1, peak+2] bins:", peak_logit_values)
+            # pred_distogram_delta = (peak_logit_values.sort(dim=-1)[0][..., 1:] - peak_logit_values.sort(dim=-1)[0][..., :-1]).mean()
+            # print("pred_distogram_delta", pred_distogram_delta)
 
-                        # Revert to uncompiled version for validation
-                        if self.is_pairformer_compiled and not self.training:
-                            pairformer_module = self.pairformer_module._orig_mod  # noqa: SLF001
-                        else:
-                            pairformer_module = self.pairformer_module
+            # Ground truth distogram
+            # Aggregate distogram over K conformers
+            assert len(feats["disto_target"].shape) == 5
+            print(feats["disto_target"].shape)
+            disto_target = feats["disto_target"].sum(dim=3).detach()  # (1, L, L, n_bins)
+            disto_target = disto_target.repeat(diffusion_samples, 1, 1, 1)
 
-                        s, z = pairformer_module(
-                            s,
-                            z,
-                            mask=mask,
-                            pair_mask=pair_mask,
-                            use_kernels=self.use_kernels,
-                        )
+            pred_logits_mean = pred_distogram_logits.mean()
+            pred_logits_min = pred_distogram_logits.min()
+            pred_logits_max = pred_distogram_logits.max()
+            distogram_scale = pred_logits_max - pred_logits_min
 
-            pdistogram = self.distogram_module(z)
-            dict_out = {
-                "pdistogram": pdistogram,
-                "s": s,
-                "z": z,
-            }
+            print("pred_logits_mean", pred_logits_mean)
+            print("pred_logits_min", pred_logits_min)
+            print("pred_logits_max", pred_logits_max)
+            print("distogram_scale", distogram_scale)
 
-            if (
-                self.run_trunk_and_structure
-                and ((not self.training) or self.confidence_prediction)
-                and (not self.skip_run_structure)
-            ):
+            ############################ Smooth Distogram ############################
+
+            # Convert gt probabilities to logits, using the predicted range
+            disto_target_logits = torch.where(disto_target == 1., pred_logits_max, pred_logits_min)
+            print("disto_target_logits", disto_target_logits)
+
+            smoothed_disto_target_logits = disto_target_logits
+            kernel_size = 5  # Fixed size for linear kernel
+        
+            # Create triangular kernel with size 9 and peak at middle
+            mid_point = (kernel_size - 1) // 2
+            triangular_kernel = torch.zeros(
+                kernel_size,
+                device=disto_target.device,
+                dtype=torch.float32
+            )
+            triangular_kernel[:mid_point+1] = torch.linspace(0, 1, mid_point+1)
+            triangular_kernel[mid_point:] = torch.linspace(1, 0, kernel_size-mid_point)
+            triangular_kernel = triangular_kernel / triangular_kernel.sum()  # Normalize
+            triangular_kernel = triangular_kernel.view(1, 1, -1)
+        
+            b, l, _, n_bins = disto_target_logits.shape
+            disto_target_logits_reshaped = disto_target_logits.view(
+                b * l * l, 1, n_bins
+            ).float()
+
+            # Use reflect padding to handle boundaries correctly, avoiding wrap-around artifacts.
+            # F.pad with mode='reflect' can fail on large tensors, so we implement it manually.
+            padding_size = (kernel_size - 1) // 2
+            if padding_size > 0:
+                left_pad = disto_target_logits_reshaped[
+                    :, :, 1 : 1 + padding_size
+                ].flip(-1)
+                right_pad = disto_target_logits_reshaped[
+                    :, :, -1 - padding_size : -1
+                ].flip(-1)
+                padded_logits = torch.cat(
+                    [left_pad, disto_target_logits_reshaped, right_pad], dim=-1
+                )
+            else:
+                padded_logits = disto_target_logits_reshaped
+
+            smoothed_disto_target_logits_reshaped = F.conv1d(
+                padded_logits, triangular_kernel, padding="valid"
+            )
+            smoothed_disto_target_logits = (
+                smoothed_disto_target_logits_reshaped.view(b, l, l, n_bins)
+            )
+            print("smoothed_disto_target_logits", smoothed_disto_target_logits)
+            disto_target_logits = smoothed_disto_target_logits
+
+            ############################ Normalize Distogram ############################
+
+            # Normalize smoothed gt logits using offset and clamping
+            gt_logits_mean = smoothed_disto_target_logits.mean()
+            gt_logits_scale = smoothed_disto_target_logits.max() - smoothed_disto_target_logits.min()
+            normalized_smoothed_disto_target_logits = pred_logits_mean + (smoothed_disto_target_logits - gt_logits_mean) * (distogram_scale / gt_logits_scale)
+
+            print("normalized_smoothed_disto_target_logits", normalized_smoothed_disto_target_logits)
+
+            disto_target_logits = torch.clamp(normalized_smoothed_disto_target_logits, min=pred_logits_min, max=pred_logits_max)
+
+            print("final disto_target_logits", disto_target_logits)
+            print("final disto_target_logits mean", disto_target_logits.mean())
+
+            ############################ Extract Pair Features from Distogram ############################
+
+            distogram_linear = self.distogram_module.distogram
+            disto_target_logits_no_bias = (
+                disto_target_logits - distogram_linear.bias.detach()
+            )
+            gt_z = (
+                torch.einsum(
+                    "bklj, ij->bkli",
+                    disto_target_logits_no_bias,
+                    torch.linalg.pinv(distogram_linear.weight.detach()),
+                )
+                / 2
+            )
+            print("z shape", z.shape)
+            print("gt_z shape", gt_z.shape)
+            print("symmetric gt_z", torch.allclose(gt_z, gt_z.transpose(1, 2)))
+            # assert torch.allclose(
+            #     torch.argmax(self.distogram_module(gt_z).float()[:, :, :, 0], dim=-1),
+            #     torch.argmax(disto_target_logits.float(), dim=-1),
+            #     atol=1e-4,
+            # ), f"gt_z: {torch.argmax(self.distogram_module(gt_z).float()[:, :, :, 0], dim=-1)}, disto_target_logits: {torch.argmax(disto_target_logits.float(), dim=-1)}"
+
+        if (
+            self.run_trunk_and_structure
+            and ((not self.training) or self.confidence_prediction)
+            and (not self.skip_run_structure)
+        ):
+            diffusion_conditioning_list = []
+
+            for i, (s, z) in enumerate(zip(s_list, z_list)):
+                print("diffusion conditioning sample", i)
+                
                 if self.checkpoint_diffusion_conditioning and self.training:
                     # TODO decide whether this should be with bf16 or not
                     q, c, to_keys, atom_enc_bias, atom_dec_bias, token_trans_bias = (
                         torch.utils.checkpoint.checkpoint(
                             self.diffusion_conditioning,
                             s,
-                            z,
+                            z if not self.predict_args.get("structure_ablation", False) else gt_z,
                             relative_position_encoding,
                             feats,
                         )
@@ -515,11 +666,16 @@ class Boltz2(LightningModule):
                     q, c, to_keys, atom_enc_bias, atom_dec_bias, token_trans_bias = (
                         self.diffusion_conditioning(
                             s_trunk=s,
-                            z_trunk=z,
+                            z_trunk=z if not self.predict_args.get("structure_ablation", False) else gt_z,
                             relative_position_encoding=relative_position_encoding,
                             feats=feats,
                         )
                     )
+                # print("q shape", q.shape)
+                # print("c shape", c.shape)
+                # print("atom_enc_bias shape", atom_enc_bias.shape)
+                # print("atom_dec_bias shape", atom_dec_bias.shape)
+                # print("token_trans_bias shape", token_trans_bias.shape)
                 diffusion_conditioning = {
                     "q": q,
                     "c": c,
@@ -528,63 +684,116 @@ class Boltz2(LightningModule):
                     "atom_dec_bias": atom_dec_bias,
                     "token_trans_bias": token_trans_bias,
                 }
+                diffusion_conditioning_list.append(diffusion_conditioning)
 
-                with torch.autocast("cuda", enabled=False):
+            if self.steering_args.get("use_confidence", False) or self.logmd_args.get("logmd_confidence", False) or self.logmd_args.get("save_intermediate_confidence", False):
+                confidence_kwargs = {
+                    "confidence_module": self.confidence_module,
+                    "pred_distogram_logits": pdistogram.detach(),
+                    "run_sequentially": run_confidence_sequentially,
+                    "z_trunk": z_list if not self.predict_args.get("structure_ablation", False) else gt_z,
+                }
+                if self.steering_args.get("use_boltz1_confidence_steering", False):
+                    b1_model = self.boltz1_model_container[0]
+                    b1_model = b1_model.to(dtype=self.dtype)
+
+                    # Optionally add Boltz1 trunk features
+                    if self.steering_args.get("use_boltz1_trunk_features", False):
+                        # Move model to GPU and set correct dtype before use
+                        b1_model.to(s_inputs.device)
+                        s_inputs_b1, s_b1, z_b1, _, _ = b1_model.trunk_forward(
+                            feats["boltz1_feats"], recycling_steps
+                        )
+                        confidence_kwargs["boltz1_trunk_features"] = {
+                            "s_inputs": s_inputs_b1.to(self.dtype),
+                            "s": s_b1.to(self.dtype),
+                            "z": z_b1.to(self.dtype),
+                        }
+                        b1_model.to("cpu") # save memory
+                        torch.cuda.empty_cache()
+                    # Always hand over the Boltz1 confidence module
+                    boltz1_conf_mod = self.boltz1_model_container[0].confidence_module
+                    boltz1_conf_mod.to(s_inputs.device)
+                    boltz1_conf_mod.use_s_diffusion = False # token rep of Boltz1 and 2 is different so s_diffusion also different
+                    confidence_kwargs["boltz1_confidence_module"] = boltz1_conf_mod
+            else:
+                confidence_kwargs = None
+
+            if max_multiplicity is None or max_multiplicity > diffusion_samples:
+                max_multiplicity = diffusion_samples
+            merged_struct_out = None
+            with torch.autocast("cuda", enabled=False):
+                for i in range(math.ceil(diffusion_samples / max_multiplicity)):
                     struct_out = self.structure_module.sample(
-                        s_trunk=s.float(),
+                        s_trunk=[s.float() for s in s_list],
                         s_inputs=s_inputs.float(),
                         feats=feats,
                         num_sampling_steps=num_sampling_steps,
                         atom_mask=feats["atom_pad_mask"].float(),
-                        multiplicity=diffusion_samples,
+                        multiplicity=max_multiplicity if i < diffusion_samples // max_multiplicity else diffusion_samples % max_multiplicity,
                         max_parallel_samples=max_parallel_samples,
                         steering_args=self.steering_args,
-                        diffusion_conditioning=diffusion_conditioning,
+                        logmd_args=self.logmd_args,
+                        diffusion_conditioning=diffusion_conditioning_list,
+                        confidence_kwargs=confidence_kwargs,
+                        superposition=self.predict_args.get("superposition", True),
                     )
-                    dict_out.update(struct_out)
+                    if merged_struct_out is None:
+                        merged_struct_out = struct_out
+                    else:
+                        for k, v in struct_out.items():
+                            if v is not None:
+                                merged_struct_out[k] = torch.cat([merged_struct_out[k].cpu(), v.cpu()], dim=0) # save memory for large diffusion_samples
+                dict_out.update(merged_struct_out)
 
-                if self.predict_bfactor:
-                    pbfactor = self.bfactor_module(s)
-                    dict_out["pbfactor"] = pbfactor
+            print("Struture Prediction Done")
 
-            if self.training and self.confidence_prediction:
-                assert len(feats["coords"].shape) == 4
-                assert feats["coords"].shape[1] == 1, (
-                    "Only one conformation is supported for confidence"
+            if self.predict_bfactor:
+                pbfactor = self.bfactor_module(s)
+                dict_out["pbfactor"] = pbfactor
+
+        if self.training and self.confidence_prediction:
+            assert len(feats["coords"].shape) == 4
+            assert (
+                feats["coords"].shape[1] == 1
+            )  # Only one conformation is supported for confidence
+
+        # Compute structure module
+        if self.training and self.structure_prediction_training:
+            assert s_z_samples == 1, "Structure Training only supports 1 sample"
+
+            atom_coords = feats["coords"]
+            B, K, L = atom_coords.shape[0:3]
+            assert K in (
+                multiplicity_diffusion_train,
+                1,
+            )  # TODO make check somewhere else, expand to m % N == 0, m > N
+            atom_coords = atom_coords.reshape(B * K, L, 3)
+            atom_coords = atom_coords.repeat_interleave(
+                multiplicity_diffusion_train // K, 0
+            )
+            feats["coords"] = atom_coords  # (multiplicity, L, 3)
+            assert len(feats["coords"].shape) == 3
+
+            with torch.autocast("cuda", enabled=False):
+                struct_out = self.structure_module(
+                    s_trunk=s_list[0].float(),
+                    s_inputs=s_inputs.float(),
+                    feats=feats,
+                    multiplicity=multiplicity_diffusion_train,
+                    diffusion_conditioning=diffusion_conditioning,
                 )
+                dict_out.update(struct_out)
 
-            # Compute structure module
-            if self.training and self.structure_prediction_training:
-                atom_coords = feats["coords"]
-                B, K, L = atom_coords.shape[0:3]
-                assert K in (
-                    multiplicity_diffusion_train,
-                    1,
-                )  # TODO make check somewhere else, expand to m % N == 0, m > N
-                atom_coords = atom_coords.reshape(B * K, L, 3)
-                atom_coords = atom_coords.repeat_interleave(
-                    multiplicity_diffusion_train // K, 0
-                )
-                feats["coords"] = atom_coords  # (multiplicity, L, 3)
-                assert len(feats["coords"].shape) == 3
-
-                with torch.autocast("cuda", enabled=False):
-                    struct_out = self.structure_module(
-                        s_trunk=s.float(),
-                        s_inputs=s_inputs.float(),
-                        feats=feats,
-                        multiplicity=multiplicity_diffusion_train,
-                        diffusion_conditioning=diffusion_conditioning,
-                    )
-                    dict_out.update(struct_out)
-
-            elif self.training:
-                feats["coords"] = feats["coords"].squeeze(1)
-                assert len(feats["coords"].shape) == 3
+        elif self.training:
+            feats["coords"] = feats["coords"].squeeze(1)
+            assert len(feats["coords"].shape) == 3
 
         if self.confidence_prediction:
-            dict_out.update(
-                self.confidence_module(
+            print("Boltz2 Confidence Calculation")
+            confidence_outputs = []
+            for i, (s, z) in enumerate(zip(s_list, z_list)):
+                confidence_out = self.confidence_module(
                     s_inputs=s_inputs.detach(),
                     s=s.detach(),
                     z=z.detach(),
@@ -596,16 +805,167 @@ class Boltz2(LightningModule):
                     feats=feats,
                     pred_distogram_logits=(
                         dict_out["pdistogram"][
-                            :, :, :, 0
-                        ].detach()  # TODO only implemented for 1 distogram
+                            :, :, :, i
+                        ].detach()  # TODO only implemeted for 1 distogram
                     ),
                     multiplicity=diffusion_samples,
                     run_sequentially=run_confidence_sequentially,
                     use_kernels=self.use_kernels,
                 )
+                def move_to_cpu(obj):
+                    if isinstance(obj, torch.Tensor):
+                        return obj.cpu()
+                    elif isinstance(obj, dict):
+                        return {k: move_to_cpu(v) for k, v in obj.items()}
+                    return obj
+                confidence_outputs.append(move_to_cpu(confidence_out))
+
+            if confidence_outputs:
+                mean_confidence_out = {}
+                num_samples = len(confidence_outputs)
+                if num_samples > 0:
+                    for key in confidence_outputs[0]:
+                        if key == "pair_chains_iptm":
+                            mean_confidence_out[key] = {}
+                            for idx1 in confidence_outputs[0][key]:
+                                mean_confidence_out[key][idx1] = {}
+                                for idx2 in confidence_outputs[0][key][idx1]:
+                                    tensors_to_stack = [
+                                        co[key][idx1][idx2]
+                                        for co in confidence_outputs
+                                    ]
+                                    mean_confidence_out[key][idx1][idx2] = (
+                                        torch.stack(tensors_to_stack).mean(dim=0)
+                                    )
+                        else:
+                            tensors_to_stack = [
+                                co[key] for co in confidence_outputs
+                            ]
+                            mean_confidence_out[key] = torch.stack(
+                                tensors_to_stack
+                            ).mean(dim=0)
+                    dict_out.update(mean_confidence_out)
+
+            if self.steering_args.get("use_boltz1_confidence_steering", False):
+                print("Boltz1 Confidence Calculation")
+
+                b1_model = self.boltz1_model_container[0]
+                b1_model = b1_model.to(dtype=self.dtype)
+                
+                if self.steering_args.get("use_boltz1_trunk_features", False):
+                    if confidence_kwargs is not None:
+                        bl_feats = confidence_kwargs["boltz1_trunk_features"]
+                        s_inputs_b1 = bl_feats["s_inputs"]
+                        s_b1 = bl_feats["s"]
+                        z_b1 = bl_feats["z"]
+                    else:
+                        b1_model.to(s_inputs.device)
+                        s_inputs_b1, s_b1, z_b1, _, _ = b1_model.trunk_forward(
+                            feats["boltz1_feats"], recycling_steps
+                        )
+                        s_inputs_b1 = s_inputs_b1.to(self.dtype)
+                        s_b1 = s_b1.to(self.dtype)
+                        z_b1 = z_b1.to(self.dtype)
+                        b1_model.to("cpu")
+                        torch.cuda.empty_cache()
+                else:
+                    b1_feats = confidence_kwargs["boltz1_trunk_features"]
+                    s_inputs_b1 = s_inputs
+                    s_b1 = s
+                    z_b1 = z
+                boltz1_conf_mod = self.boltz1_model_container[0].confidence_module
+                boltz1_conf_mod.to(s_inputs.device)
+                boltz1_conf_mod.use_s_diffusion = False # token rep of Boltz1 and 2 is different so s_diffusion also different
+                boltz1_confidence_out = boltz1_conf_mod(
+                    s_inputs=s_inputs_b1,
+                    s=s_b1,
+                    z=z_b1,
+                    s_diffusion=None,
+                    x_pred=(
+                        dict_out["sample_atom_coords"].detach()
+                        if not self.skip_run_structure
+                        else feats["coords"].repeat_interleave(diffusion_samples, 0)
+                    ),
+                    feats=feats["boltz1_feats"] if self.steering_args.get("use_boltz1_trunk_features", False) else feats,
+                    pred_distogram_logits=(
+                        dict_out["pdistogram"][
+                            :, :, :, :
+                        ].mean(dim=3).detach()  # mean over pd samples
+                    ),
+                    multiplicity=diffusion_samples,
+                    run_sequentially=run_confidence_sequentially,
+                    use_kernels=self.use_kernels,
+                )
+                dict_out.update({f"{k}_boltz1": v for k, v in boltz1_confidence_out.items()})
+
+        if (
+            self.predict_args.get("confidence_ablation", False)
+            and not self.training
+            and self.confidence_prediction
+        ):
+            assert s_z_samples == 1, "Confidence ablation only supports 1 sample"
+            
+            # Predicted coords
+            pred_coords = dict_out["sample_atom_coords"].detach()
+            print("pred_coords shape", pred_coords.shape)
+            print("pred_coords", pred_coords)
+
+            # Ground truth coords
+            gt_coords = feats["coords"].squeeze(1)  # B, L, 3
+            print("gt_coords shape", gt_coords.shape)
+            print("gt_coords", gt_coords)
+
+            # Ablation cases
+            # 1. pred_disto + gt_coords
+            ablation_pd_gtc = self.confidence_module(
+                s_inputs=s_inputs.detach(),
+                s=s.detach(),
+                z=z.detach(),
+                x_pred=gt_coords.repeat(diffusion_samples, 1, 1).contiguous(),
+                feats=feats,
+                pred_distogram_logits=pred_distogram_logits.repeat(
+                    diffusion_samples, 1, 1, 1
+                ).contiguous(),
+                multiplicity=diffusion_samples,
+                run_sequentially=run_confidence_sequentially,
+                use_kernels=self.use_kernels,
             )
+            dict_out.update({f"ablation_pd_gtc_{k}": v for k, v in ablation_pd_gtc.items()})
+
+            # 2. gt_disto + pred_coords
+            ablation_gtd_pc = self.confidence_module(
+                s_inputs=s_inputs.detach(),
+                s=s.detach(),
+                z=gt_z.detach(),
+                x_pred=pred_coords,
+                feats=feats,
+                pred_distogram_logits=disto_target_logits.contiguous(),
+                multiplicity=diffusion_samples,
+                run_sequentially=run_confidence_sequentially,
+                use_kernels=self.use_kernels,
+            )
+            dict_out.update({f"ablation_gtd_pc_{k}": v for k, v in ablation_gtd_pc.items()})
+
+            if self.predict_args.get("confidence_ablation_all_gt", False):
+                # 3. gt_disto + gt_coords
+                ablation_gtd_gtc = self.confidence_module(
+                    s_inputs=s_inputs.detach(),
+                    s=s.detach(),
+                    z=gt_z.detach(),
+                    x_pred=gt_coords.repeat(diffusion_samples, 1, 1).contiguous(),
+                    feats=feats,
+                    pred_distogram_logits=disto_target_logits.contiguous(),
+                    multiplicity=diffusion_samples,
+                    run_sequentially=run_confidence_sequentially,
+                    use_kernels=self.use_kernels,
+                )
+                dict_out.update(
+                    {f"ablation_gtd_gtc_{k}": v for k, v in ablation_gtd_gtc.items()}
+                )
 
         if self.affinity_prediction:
+            assert s_z_samples == 1, "Affinity prediction only supports 1 sample"
+
             pad_token_mask = feats["token_pad_mask"][0]
             rec_mask = feats["mol_type"][0] == 0
             rec_mask = rec_mask * pad_token_mask
@@ -735,9 +1095,9 @@ class Boltz2(LightningModule):
 
         return_dict = {}
 
-        assert batch["coords"].shape[0] == 1, (
-            f"Validation is not supported for batch sizes={batch['coords'].shape[0]}"
-        )
+        assert (
+            batch["coords"].shape[0] == 1
+        ), f"Validation is not supported for batch sizes={batch['coords'].shape[0]}"
 
         if symmetry_correction:
             true_coords = []
@@ -863,9 +1223,9 @@ class Boltz2(LightningModule):
 
             # TODO remove once multiple conformers are supported
             K = true_coords.shape[1]
-            assert K == 1, (
-                f"Confidence_prediction is not supported for num_ensembles_val={K}."
-            )
+            assert (
+                K == 1
+            ), f"Confidence_prediction is not supported for num_ensembles_val={K}."
 
             # For now, just take the only conformer.
             true_coords = true_coords.squeeze(1)  # (S, L, 3)
@@ -1059,9 +1419,11 @@ class Boltz2(LightningModule):
             out = self(
                 batch,
                 recycling_steps=self.predict_args["recycling_steps"],
+                s_z_samples=self.predict_args["s_z_samples"],
                 num_sampling_steps=self.predict_args["sampling_steps"],
                 diffusion_samples=self.predict_args["diffusion_samples"],
                 max_parallel_samples=self.predict_args["max_parallel_samples"],
+                max_multiplicity=self.predict_args["max_multiplicity"],
                 run_confidence_sequentially=True,
             )
             pred_dict = {"exception": False}
@@ -1071,13 +1433,13 @@ class Boltz2(LightningModule):
 
             pred_dict["masks"] = batch["atom_pad_mask"]
             pred_dict["token_masks"] = batch["token_pad_mask"]
-            pred_dict["s"] = out["s"]
-            pred_dict["z"] = out["z"]
 
             if "keys_dict_out" in self.predict_args:
                 for key in self.predict_args["keys_dict_out"]:
                     pred_dict[key] = out[key]
             pred_dict["coords"] = out["sample_atom_coords"]
+            if "pdistogram" in out:
+                pred_dict["pdistogram"] = out["pdistogram"]
             if self.confidence_prediction:
                 # pred_dict["confidence"] = out.get("ablation_confidence", None)
                 pred_dict["pde"] = out["pde"]
@@ -1104,6 +1466,23 @@ class Boltz2(LightningModule):
                     pred_dict["ligand_iptm"] = out["ligand_iptm"]
                     pred_dict["protein_iptm"] = out["protein_iptm"]
                     pred_dict["pair_chains_iptm"] = out["pair_chains_iptm"]
+                    # pred_dict["ptm_energy"] = out["ptm_energy"]  # Not returned by confidence_v2.py
+                    # pred_dict["iptm_energy"] = out["iptm_energy"]  # Not returned by confidence_v2.py
+                if "plddt_boltz1" in out:
+                    pred_dict["pde_boltz1"] = out["pde_boltz1"]
+                    pred_dict["plddt_boltz1"] = out["plddt_boltz1"]
+                    pred_dict["complex_plddt_boltz1"] = out["complex_plddt_boltz1"]
+                    pred_dict["complex_iplddt_boltz1"] = out["complex_iplddt_boltz1"]
+                    pred_dict["complex_pde_boltz1"] = out["complex_pde_boltz1"]
+                    pred_dict["complex_ipde_boltz1"] = out["complex_ipde_boltz1"]
+                    if self.alpha_pae > 0:
+                        pred_dict["pae_boltz1"] = out["pae_boltz1"]
+                        pred_dict["ptm_boltz1"] = out["ptm_boltz1"]
+                        pred_dict["iptm_boltz1"] = out["iptm_boltz1"]
+                        pred_dict["ligand_iptm_boltz1"] = out["ligand_iptm_boltz1"]
+                        pred_dict["protein_iptm_boltz1"] = out["protein_iptm_boltz1"]
+                        pred_dict["pair_chains_iptm_boltz1"] = out["pair_chains_iptm_boltz1"]
+                        # Energy fields intentionally omitted for v2
             if self.affinity_prediction:
                 pred_dict["affinity_pred_value"] = out["affinity_pred_value"]
                 pred_dict["affinity_probability_binary"] = out[
@@ -1118,6 +1497,24 @@ class Boltz2(LightningModule):
                     pred_dict["affinity_probability_binary2"] = out[
                         "affinity_probability_binary2"
                     ]
+            if self.predict_args.get("confidence_ablation", False):
+                for prefix in ["ablation_pd_gtc_", "ablation_gtd_pc_"]:
+                    if f"{prefix}plddt" in out:
+                        pred_dict[f"{prefix}plddt"] = out[f"{prefix}plddt"]
+                        pred_dict[f"{prefix}pde"] = out[f"{prefix}pde"]
+                        pred_dict[f"{prefix}pae"] = out[f"{prefix}pae"]
+                        pred_dict[f"{prefix}ptm"] = out[f"{prefix}ptm"]
+                        pred_dict[f"{prefix}iptm"] = out[f"{prefix}iptm"]
+
+            if self.predict_args.get("confidence_ablation_all_gt", False):
+                prefix = "ablation_gtd_gtc_"
+                if f"{prefix}plddt" in out:
+                    pred_dict[f"{prefix}plddt"] = out[f"{prefix}plddt"]
+                    pred_dict[f"{prefix}pde"] = out[f"{prefix}pde"]
+                    pred_dict[f"{prefix}pae"] = out[f"{prefix}pae"]
+                    pred_dict[f"{prefix}ptm"] = out[f"{prefix}ptm"]
+                    pred_dict[f"{prefix}iptm"] = out[f"{prefix}iptm"]
+
             return pred_dict
 
         except RuntimeError as e:  # catch out of memory exceptions
@@ -1127,7 +1524,7 @@ class Boltz2(LightningModule):
                 gc.collect()
                 return {"exception": True}
             else:
-                raise e
+                raise {"exception": True}
 
     def configure_optimizers(self) -> torch.optim.Optimizer:
         """Configure the optimizer."""
@@ -1253,3 +1650,101 @@ class Boltz2(LightningModule):
 
         """
         return [EMA(self.ema_decay)] if self.use_ema else []
+
+    def trunk_forward(
+        self,
+        feats: dict[str, Tensor],
+        recycling_steps: int = 0,
+    ):
+        with torch.set_grad_enabled(
+            self.training and self.structure_prediction_training
+        ):
+            s_inputs = self.input_embedder(feats)
+
+            # Initialize the sequence embeddings
+            s_init = self.s_init(s_inputs)
+
+            # Initialize pairwise embeddings
+            z_init = (
+                self.z_init_1(s_inputs)[:, :, None]
+                + self.z_init_2(s_inputs)[:, None, :]
+            )
+            relative_position_encoding = self.rel_pos(feats)
+            z_init = z_init + relative_position_encoding
+            z_init = z_init + self.token_bonds(feats["token_bonds"].float())
+            if self.bond_type_feature:
+                z_init = z_init + self.token_bonds_type(feats["type_bonds"].long())
+            z_init = z_init + self.contact_conditioning(feats)
+
+            if not self.is_in_dataparallel and next(self.pairformer_module.parameters()).device != s_init.device:
+                self.pairformer_module = self.pairformer_module.to(s_init.device)
+
+            # Perform rounds of the pairwise stack
+            s = torch.zeros_like(s_init)
+            z = torch.zeros_like(z_init)
+
+            # Compute pairwise mask
+            mask = feats["token_pad_mask"].float()
+            pair_mask = mask[:, :, None] * mask[:, None, :]
+            if self.run_trunk_and_structure:
+                for i in range(recycling_steps + 1):
+                    with torch.set_grad_enabled(
+                        self.training
+                        and self.structure_prediction_training
+                        and (i == recycling_steps)
+                    ):
+                        # Issue with unused parameters in autocast
+                        if (
+                            self.training
+                            and (i == recycling_steps)
+                            and torch.is_autocast_enabled()
+                        ):
+                            torch.clear_autocast_cache()
+
+                        # Apply recycling
+                        s = s_init + self.s_recycle(self.s_norm(s))
+                        z = z_init + self.z_recycle(self.z_norm(z))
+
+                        # Compute pairwise stack
+                        if self.use_templates:
+                            if self.is_template_compiled and not self.training:
+                                template_module = self.template_module._orig_mod  # noqa: SLF001
+                            else:
+                                template_module = self.template_module
+
+                            z = z + template_module(
+                                z, feats, pair_mask, use_kernels=self.use_kernels
+                            )
+
+                        if self.is_msa_compiled and not self.training:
+                            msa_module = self.msa_module._orig_mod  # noqa: SLF001
+                        else:
+                            msa_module = self.msa_module
+
+                        z = z + msa_module(
+                            z, s_inputs, feats, use_kernels=self.use_kernels, use_dropout=self.use_dropout
+                        )
+
+                        # Revert to uncompiled version for validation
+                        if self.is_pairformer_compiled and not self.training:
+                            pairformer_module = self.pairformer_module._orig_mod  # noqa: SLF001
+                        else:
+                            pairformer_module = self.pairformer_module
+
+                        s, z = pairformer_module(
+                            s,
+                            z,
+                            mask=mask,
+                            pair_mask=pair_mask,
+                            use_kernels=self.use_kernels,
+                            use_dropout=self.use_dropout,
+                        )
+                
+                if not self.training and not self.is_in_dataparallel:
+                    self.msa_module = self.msa_module.cpu()
+                    if self.use_templates:
+                        self.template_module = self.template_module.cpu()
+                    gc.collect()
+                    torch.cuda.empty_cache()
+
+        return s_inputs, s, z, relative_position_encoding

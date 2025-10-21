@@ -1,10 +1,11 @@
+import json
 import multiprocessing
 import os
 import pickle
 import platform
+import sys
 import tarfile
 import urllib.request
-import warnings
 from dataclasses import asdict, dataclass
 from functools import partial
 from multiprocessing import Pool
@@ -13,6 +14,7 @@ from typing import Literal, Optional
 
 import click
 import torch
+import torch.nn as nn
 from pytorch_lightning import Trainer, seed_everything
 from pytorch_lightning.strategies import DDPStrategy
 from pytorch_lightning.utilities import rank_zero_only
@@ -32,6 +34,26 @@ from boltz.data.types import MSA, Manifest, Record
 from boltz.data.write.writer import BoltzAffinityWriter, BoltzWriter
 from boltz.model.models.boltz1 import Boltz1
 from boltz.model.models.boltz2 import Boltz2
+
+
+class Tee:
+    """A file-like object that writes to multiple files."""
+
+    def __init__(self, *files):
+        """Initialize the Tee object."""
+        self.files = files
+
+    def write(self, obj):
+        """Write to all files."""
+        for f in self.files:
+            f.write(obj)
+            f.flush()
+
+    def flush(self):
+        """Flush all files."""
+        for f in self.files:
+            f.flush()
+
 
 CCD_URL = "https://huggingface.co/boltz-community/boltz-1/resolve/main/ccd.pkl"
 MOL_URL = "https://huggingface.co/boltz-community/boltz-2/resolve/main/mols.tar"
@@ -70,7 +92,7 @@ class PairformerArgs:
 
     num_blocks: int = 48
     num_heads: int = 16
-    dropout: float = 0.0
+    # dropout: float = 0.0
     activation_checkpointing: bool = False
     offload_to_cpu: bool = False
     v2: bool = False
@@ -82,7 +104,7 @@ class PairformerArgsV2:
 
     num_blocks: int = 64
     num_heads: int = 16
-    dropout: float = 0.0
+    # dropout: float = 0.0
     activation_checkpointing: bool = False
     offload_to_cpu: bool = False
     v2: bool = True
@@ -94,8 +116,8 @@ class MSAModuleArgs:
 
     msa_s: int = 64
     msa_blocks: int = 4
-    msa_dropout: float = 0.0
-    z_dropout: float = 0.0
+    msa_dropout: float = 0.15
+    z_dropout: float = 0.25
     use_paired_feature: bool = True
     pairwise_head_width: int = 32
     pairwise_num_heads: int = 4
@@ -148,14 +170,65 @@ class Boltz2DiffusionParams:
 class BoltzSteeringParams:
     """Steering parameters."""
 
-    fk_steering: bool = False
-    num_particles: int = 3
+    fk_steering: bool = True
+    use_potentials: bool = True
+    num_particles: int = 4
     fk_lambda: float = 4.0
     fk_resampling_interval: int = 3
-    physical_guidance_update: bool = False
-    contact_guidance_update: bool = True
+    guidance_update: bool = True
     num_gd_steps: int = 20
 
+    physical_guidance_update: bool = False
+    contact_guidance_update: bool = False
+
+    use_openmm_energy: bool = False
+    use_rosetta_energy: bool = False
+    targets_dir: Path = None
+
+    use_confidence: bool = False
+    confidence_steering_start: int = 25 # 25 # if 0, always resampled at the beginning
+    confidence_steering_end: int = 100 # 125 Full steps: 200 (later steps are mostly small refinements)
+
+    confidence_energy_type: str = "iptm"
+    confidence_s_z_samples: int = 1
+    confidence_merge_method: str = "mean"
+
+    confidence_resampling_weight: float = 10.0
+    confidence_tempering_gamma: float = 1.0
+
+    confidence_guidance_interval: int = 5 # disabled if < 0
+    confidence_guidance_type: str = "ugd"
+    confidence_guidance_every_n_steps: int = 1
+    confidence_guidance_weight: float = 10.0
+
+    structure_distogram_tau: float = 1.0
+
+    use_boltz1_confidence_steering: bool = True
+    use_boltz1_trunk_features: bool = True
+
+    use_boltz2_confidence_steering: bool = True
+    use_boltz2_trunk_features: bool = True
+
+    use_dropout: bool = False
+    dropout_samples: int = 16
+
+@dataclass
+class LogMDParams:
+    """LogMD parameters."""
+
+    logmd: bool = False
+    logmd_confidence: bool = False
+    start: int = 0
+    interval: int = 50
+    targets_dir: Path = None
+    prediction_dir: Path = None
+
+    save_intermediate_predictions: bool = False
+    save_intermediate_confidence: bool = False
+    save_every_n_steps: int = 50
+
+    save_perturbed_confidence: bool = False
+    confidence_perturbation_scale: float = 0.25
 
 @rank_zero_only
 def download_boltz1(cache: Path) -> None:
@@ -207,19 +280,13 @@ def download_boltz2(cache: Path) -> None:
     # Download CCD
     mols = cache / "mols"
     tar_mols = cache / "mols.tar"
-    if not tar_mols.exists():
+    if not mols.exists():
         click.echo(
-            f"Downloading the CCD data to {tar_mols}. "
+            f"Downloading and extracting the CCD data to {mols}. "
             "This may take a bit of time. You may change the cache directory "
             "with the --cache flag."
         )
         urllib.request.urlretrieve(MOL_URL, str(tar_mols))  # noqa: S310
-    if not mols.exists():
-        click.echo(
-            f"Extracting the CCD data to {mols}. "
-            "This may take a bit of time. You may change the cache directory "
-            "with the --cache flag."
-        )
         with tarfile.open(str(tar_mols), "r") as tar:
             tar.extractall(cache)  # noqa: S202
 
@@ -304,7 +371,7 @@ def check_inputs(data: Path) -> list[Path]:
             if d.is_dir():
                 msg = f"Found directory {d} instead of .fasta or .yaml."
                 raise RuntimeError(msg)
-            if d.suffix.lower() not in (".fa", ".fas", ".fasta", ".yml", ".yaml"):
+            if d.suffix not in (".fa", ".fas", ".fasta", ".yml", ".yaml"):
                 msg = (
                     f"Unable to parse filetype {d.suffix}, "
                     "please provide a .fasta or .yaml file."
@@ -338,25 +405,23 @@ def filter_inputs_structure(
         The manifest of the filtered input data.
 
     """
-    # Check if existing predictions are found (only top-level prediction folders)
-    pred_dir = outdir / "predictions"
-    if pred_dir.exists():
-        existing = {d.name for d in pred_dir.iterdir() if d.is_dir()}
-    else:
-        existing = set()
+    # Check if existing predictions are found
+    existing = (outdir / "predictions").glob("*")
+    existing = {e.name for e in existing if e.is_dir()}
 
     # Remove them from the input data
     if existing and not override:
         manifest = Manifest([r for r in manifest.records if r.id not in existing])
+        num_skipped = len(existing) - len(manifest.records)
         msg = (
-            f"Found some existing predictions ({len(existing)}), "
+            f"Found some existing predictions ({num_skipped}), "
             f"skipping and running only the missing ones, "
             "if any. If you wish to override these existing "
             "predictions, please set the --override flag."
         )
         click.echo(msg)
     elif existing and override:
-        msg = f"Found {len(existing)} existing predictions, will override."
+        msg = "Found existing predictions, will override."
         click.echo(msg)
 
     return manifest
@@ -396,7 +461,6 @@ def filter_inputs_affinity(
 
     # Remove them from the input data
     if existing and not override:
-        manifest = Manifest([r for r in manifest.records if r.id not in existing])
         num_skipped = len(existing)
         msg = (
             f"Found some existing affinity predictions ({num_skipped}), "
@@ -409,7 +473,7 @@ def filter_inputs_affinity(
         msg = "Found existing affinity predictions, will override."
         click.echo(msg)
 
-    return manifest
+    return Manifest([r for r in manifest.records if r.id not in existing])
 
 
 def compute_msa(
@@ -418,10 +482,6 @@ def compute_msa(
     msa_dir: Path,
     msa_server_url: str,
     msa_pairing_strategy: str,
-    msa_server_username: Optional[str] = None,
-    msa_server_password: Optional[str] = None,
-    api_key_header: Optional[str] = None,
-    api_key_value: Optional[str] = None,
 ) -> None:
     """Compute the MSA for the input data.
 
@@ -437,35 +497,8 @@ def compute_msa(
         The MSA server URL.
     msa_pairing_strategy : str
         The MSA pairing strategy.
-    msa_server_username : str, optional
-        Username for basic authentication with MSA server.
-    msa_server_password : str, optional
-        Password for basic authentication with MSA server.
-    api_key_header : str, optional
-        Custom header key for API key authentication (default: X-API-Key).
-    api_key_value : str, optional
-        Custom header value for API key authentication (overrides --api_key if set).
 
     """
-    click.echo(f"Calling MSA server for target {target_id} with {len(data)} sequences")
-    click.echo(f"MSA server URL: {msa_server_url}")
-    click.echo(f"MSA pairing strategy: {msa_pairing_strategy}")
-    
-    # Construct auth headers if API key header/value is provided
-    auth_headers = None
-    if api_key_value:
-        key = api_key_header if api_key_header else "X-API-Key"
-        value = api_key_value
-        auth_headers = {
-            "Content-Type": "application/json",
-            key: value
-        }
-        click.echo(f"Using API key authentication for MSA server (header: {key})")
-    elif msa_server_username and msa_server_password:
-        click.echo("Using basic authentication for MSA server")
-    else:
-        click.echo("No authentication provided for MSA server")
-    
     if len(data) > 1:
         paired_msas = run_mmseqs2(
             list(data.values()),
@@ -474,9 +507,6 @@ def compute_msa(
             use_pairing=True,
             host_url=msa_server_url,
             pairing_strategy=msa_pairing_strategy,
-            msa_server_username=msa_server_username,
-            msa_server_password=msa_server_password,
-            auth_headers=auth_headers,
         )
     else:
         paired_msas = [""] * len(data)
@@ -488,9 +518,6 @@ def compute_msa(
         use_pairing=False,
         host_url=msa_server_url,
         pairing_strategy=msa_pairing_strategy,
-        msa_server_username=msa_server_username,
-        msa_server_password=msa_server_password,
-        auth_headers=auth_headers,
     )
 
     for idx, name in enumerate(data):
@@ -531,10 +558,6 @@ def process_input(  # noqa: C901, PLR0912, PLR0915, D103
     use_msa_server: bool,
     msa_server_url: str,
     msa_pairing_strategy: str,
-    msa_server_username: Optional[str],
-    msa_server_password: Optional[str],
-    api_key_header: Optional[str],
-    api_key_value: Optional[str],
     max_msa_seqs: int,
     processed_msa_dir: Path,
     processed_constraints_dir: Path,
@@ -542,12 +565,14 @@ def process_input(  # noqa: C901, PLR0912, PLR0915, D103
     processed_mols_dir: Path,
     structure_dir: Path,
     records_dir: Path,
+    standardize_smiles: bool,
 ) -> None:
     try:
         # Parse data
-        if path.suffix.lower() in (".fa", ".fas", ".fasta"):
+        print(f"Parsing {path}")
+        if path.suffix in (".fa", ".fas", ".fasta"):
             target = parse_fasta(path, ccd, mol_dir, boltz2)
-        elif path.suffix.lower() in (".yml", ".yaml"):
+        elif path.suffix in (".yml", ".yaml"):
             target = parse_yaml(path, ccd, mol_dir, boltz2)
         elif path.is_dir():
             msg = f"Found directory {path} instead of .fasta or .yaml, skipping."
@@ -591,10 +616,6 @@ def process_input(  # noqa: C901, PLR0912, PLR0915, D103
                 msa_dir=msa_dir,
                 msa_server_url=msa_server_url,
                 msa_pairing_strategy=msa_pairing_strategy,
-                msa_server_username=msa_server_username,
-                msa_server_password=msa_server_password,
-                api_key_header=api_key_header,
-                api_key_value=api_key_value,
             )
 
         # Parse MSA data
@@ -669,14 +690,12 @@ def process_inputs(
     mol_dir: Path,
     msa_server_url: str,
     msa_pairing_strategy: str,
+    output_subdirectory: str = "processed",
     max_msa_seqs: int = 8192,
     use_msa_server: bool = False,
-    msa_server_username: Optional[str] = None,
-    msa_server_password: Optional[str] = None,
-    api_key_header: Optional[str] = None,
-    api_key_value: Optional[str] = None,
     boltz2: bool = False,
     preprocessing_threads: int = 1,
+    standardize_smiles: bool = True,
 ) -> Manifest:
     """Process the input data and output directory.
 
@@ -689,17 +708,9 @@ def process_inputs(
     ccd_path : Path
         The path to the CCD dictionary.
     max_msa_seqs : int, optional
-        Max number of MSA sequences, by default 8192.
+        Max number of MSA sequences, by default 4096.
     use_msa_server : bool, optional
         Whether to use the MMSeqs2 server for MSA generation, by default False.
-    msa_server_username : str, optional
-        Username for basic authentication with MSA server, by default None.
-    msa_server_password : str, optional
-        Password for basic authentication with MSA server, by default None.
-    api_key_header : str, optional
-        Custom header key for API key authentication (default: X-API-Key).
-    api_key_value : str, optional
-        Custom header value for API key authentication (overrides --api_key if set).
     boltz2: bool, optional
         Whether to use Boltz2, by default False.
     preprocessing_threads: int, optional
@@ -711,18 +722,13 @@ def process_inputs(
         The manifest of the processed input data.
 
     """
-    # Validate mutually exclusive authentication methods
-    has_basic_auth = msa_server_username and msa_server_password
-    has_api_key = api_key_value is not None
-    
-    if has_basic_auth and has_api_key:
-        raise ValueError(
-            "Cannot use both basic authentication (--msa_server_username/--msa_server_password) "
-            "and API key authentication (--api_key_header/--api_key_value). Please use only one authentication method."
-        )
-
+    if "seed" in str(out_dir.parent.name):
+        base_dir = out_dir.parent.parent / out_dir.name
+    else:
+        base_dir = out_dir
+        
     # Check if records exist at output path
-    records_dir = out_dir / "processed" / "records"
+    records_dir = base_dir / output_subdirectory / "records"
     if records_dir.exists():
         # Load existing records
         existing = [Record.load(p) for p in records_dir.glob("*.json")]
@@ -739,16 +745,17 @@ def process_inputs(
         else:
             click.echo("All inputs are already processed.")
             updated_manifest = Manifest(existing)
-            updated_manifest.dump(out_dir / "processed" / "manifest.json")
+            updated_manifest.dump(base_dir / output_subdirectory / "manifest.json")
+            return updated_manifest
 
     # Create output directories
-    msa_dir = out_dir / "msa"
-    records_dir = out_dir / "processed" / "records"
-    structure_dir = out_dir / "processed" / "structures"
-    processed_msa_dir = out_dir / "processed" / "msa"
-    processed_constraints_dir = out_dir / "processed" / "constraints"
-    processed_templates_dir = out_dir / "processed" / "templates"
-    processed_mols_dir = out_dir / "processed" / "mols"
+    msa_dir = base_dir / "msa"
+    records_dir = base_dir / output_subdirectory / "records"
+    structure_dir = base_dir / output_subdirectory / "structures"
+    processed_msa_dir = base_dir / output_subdirectory / "msa"
+    processed_constraints_dir = base_dir / output_subdirectory / "constraints"
+    processed_templates_dir = base_dir / output_subdirectory / "templates"
+    processed_mols_dir = base_dir / output_subdirectory / "mols"
     predictions_dir = out_dir / "predictions"
 
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -778,10 +785,6 @@ def process_inputs(
         use_msa_server=use_msa_server,
         msa_server_url=msa_server_url,
         msa_pairing_strategy=msa_pairing_strategy,
-        msa_server_username=msa_server_username,
-        msa_server_password=msa_server_password,
-        api_key_header=api_key_header,
-        api_key_value=api_key_value,
         max_msa_seqs=max_msa_seqs,
         processed_msa_dir=processed_msa_dir,
         processed_constraints_dir=processed_constraints_dir,
@@ -789,6 +792,7 @@ def process_inputs(
         processed_mols_dir=processed_mols_dir,
         structure_dir=structure_dir,
         records_dir=records_dir,
+        standardize_smiles=standardize_smiles,
     )
 
     # Parse input data
@@ -805,7 +809,8 @@ def process_inputs(
     # Load all records and write manifest
     records = [Record.load(p) for p in records_dir.glob("*.json")]
     manifest = Manifest(records)
-    manifest.dump(out_dir / "processed" / "manifest.json")
+    manifest.dump(base_dir / output_subdirectory / "manifest.json")
+    return manifest
 
 
 @click.group()
@@ -874,6 +879,12 @@ def cli() -> None:
     default=5,
 )
 @click.option(
+    "--max_multiplicity",
+    type=int,
+    help="The maximum number of samples to predict without offloading to CPU. Default is None.",
+    default=None,
+)
+@click.option(
     "--step_scale",
     type=float,
     help=(
@@ -919,7 +930,7 @@ def cli() -> None:
     "--seed",
     type=int,
     help="Seed to use for random number generator. Default is None (no seeding).",
-    default=None,
+    default=0,
 )
 @click.option(
     "--use_msa_server",
@@ -942,33 +953,49 @@ def cli() -> None:
     default="greedy",
 )
 @click.option(
-    "--msa_server_username",
-    type=str,
-    help="MSA server username for basic auth. Used only if --use_msa_server is set. Can also be set via BOLTZ_MSA_USERNAME environment variable.",
-    default=None,
-)
-@click.option(
-    "--msa_server_password",
-    type=str,
-    help="MSA server password for basic auth. Used only if --use_msa_server is set. Can also be set via BOLTZ_MSA_PASSWORD environment variable.",
-    default=None,
-)
-@click.option(
-    "--api_key_header",
-    type=str,
-    help="Custom header key for API key authentication (default: X-API-Key).",
-    default=None,
-)
-@click.option(
-    "--api_key_value",
-    type=str,
-    help="Custom header value for API key authentication.",
-    default=None,
-)
-@click.option(
     "--use_potentials",
     is_flag=True,
-    help="Whether to use potentials for steering. Default is False.",
+    help="Whether to not use potentials for steering. Default is False.",
+)
+@click.option(
+    "--use_openmm_energy",
+    is_flag=True,
+    help="Whether to use OpenMM energy for steering. Default is False.",
+)
+@click.option(
+    "--use_rosetta_energy",
+    is_flag=True,
+    help="Whether to use Rosetta energy for steering. Default is False.",
+)
+@click.option(
+    "--confidence_steering",
+    is_flag=True,
+    help="Whether to use confidence guidance during steering. Default is False.",
+)
+@click.option(
+    "--use_confidence_dropout_steering",
+    is_flag=True,
+    help="Whether to use MC dropout for the confidence model during steering. Default is False.",
+)
+@click.option(
+    "--use_boltz1_confidence_steering",
+    is_flag=True,
+    help="Whether to use boltz1 confidence guidance during steering. Default is False.",
+)
+@click.option(
+    "--use_boltz1_trunk_features",
+    is_flag=True,
+    help="Whether to use boltz1 trunk features for confidence guidance. Default is False.",
+)
+@click.option(
+    "--use_boltz2_confidence_steering",
+    is_flag=True,
+    help="Whether to use boltz2 confidence guidance during steering. Default is False.",
+)
+@click.option(
+    "--use_boltz2_trunk_features",
+    is_flag=True,
+    help="Whether to use boltz2 trunk features for confidence guidance. Default is False.",
 )
 @click.option(
     "--model",
@@ -983,10 +1010,10 @@ def cli() -> None:
     default=None,
 )
 @click.option(
-    "--preprocessing-threads",
+    "--preprocessing_threads",
     type=int,
     help="The number of threads to use for preprocessing. Default is 1.",
-    default=multiprocessing.cpu_count(),
+    default=8,
 )
 @click.option(
     "--affinity_mw_correction",
@@ -1030,14 +1057,66 @@ def cli() -> None:
     default=1024,
 )
 @click.option(
-    "--no_kernels",
+    "--use_dropout",
     is_flag=True,
-    help="Whether to disable the kernels. Default False",
+    help="Whether to use MC dropout for the model (MSAModule & Pairformer) during inference. Default is False.",
 )
 @click.option(
-    "--write_embeddings",
+    "--s_z_samples",
+    type=int,
+    help="The number of samples to use for the z-score. Default is 1.",
+    default=1,
+)
+@click.option(
+    "--no_superposition",
     is_flag=True,
-    help=" to dump the s and z embeddings into a npz file. Default is False.",
+    help="Whether to use superposition for the model. Default is True.",
+)
+@click.option(
+    "--no_trifast",
+    is_flag=True,
+    help="Whether to not use trifast kernels for triangular updates. Default False",
+)
+@click.option(
+    "--structure_ablation",
+    is_flag=True,
+    help="Whether to run structure ablation.",
+)
+@click.option(
+    "--confidence_ablation",
+    is_flag=True,
+    help="Whether to run confidence ablation.",
+)
+@click.option(
+    "--confidence_ablation_all_gt",
+    is_flag=True,
+    help="Whether to run confidence ablation with all ground truth inputs.",
+)
+@click.option(
+    "--logmd",
+    is_flag=True,
+    help="Whether to use logMD for intermediate predictions. Default is False.",
+)
+@click.option(
+    "--save_intermediate_predictions",
+    is_flag=True,
+    help="Whether to save intermediate predictions. Default is False.",
+)
+@click.option(
+    "--save_intermediate_confidence",
+    is_flag=True,
+    help="Whether to save intermediate confidence predictions. Default is False.",
+)
+@click.option(
+    "--save_perturbed_confidence",
+    is_flag=True,
+    help="Whether to save perturbed confidence predictions. Default is False.",
+)
+@click.option(
+    "--confidence_perturbation_scale",
+    type=float,
+    help="The scale of the perturbation to apply to the confidence predictions. Default is 0.25.",
+    default=0.25,
 )
 def predict(  # noqa: C901, PLR0915, PLR0912
     data: str,
@@ -1053,6 +1132,7 @@ def predict(  # noqa: C901, PLR0915, PLR0912
     sampling_steps_affinity: int = 200,
     diffusion_samples_affinity: int = 3,
     max_parallel_samples: Optional[int] = None,
+    max_multiplicity: Optional[int] = None,
     step_scale: Optional[float] = None,
     write_full_pae: bool = False,
     write_full_pde: bool = False,
@@ -1063,11 +1143,15 @@ def predict(  # noqa: C901, PLR0915, PLR0912
     use_msa_server: bool = False,
     msa_server_url: str = "https://api.colabfold.com",
     msa_pairing_strategy: str = "greedy",
-    msa_server_username: Optional[str] = None,
-    msa_server_password: Optional[str] = None,
-    api_key_header: Optional[str] = None,
-    api_key_value: Optional[str] = None,
     use_potentials: bool = False,
+    use_openmm_energy: bool = False,
+    use_rosetta_energy: bool = False,
+    confidence_steering: bool = False,
+    use_confidence_dropout_steering: bool = False,
+    use_boltz1_confidence_steering: bool = True,
+    use_boltz1_trunk_features: bool = True,
+    use_boltz2_confidence_steering: bool = True,
+    use_boltz2_trunk_features: bool = True,
     model: Literal["boltz1", "boltz2"] = "boltz2",
     method: Optional[str] = None,
     affinity_mw_correction: Optional[bool] = False,
@@ -1075,19 +1159,24 @@ def predict(  # noqa: C901, PLR0915, PLR0912
     max_msa_seqs: int = 8192,
     subsample_msa: bool = True,
     num_subsampled_msa: int = 1024,
-    no_kernels: bool = False,
-    write_embeddings: bool = False,
+    use_dropout: bool = False,
+    s_z_samples: int = 1,
+    no_superposition: bool = False,
+    no_trifast: bool = False,
+    structure_ablation: bool = False,
+    confidence_ablation: bool = False,
+    confidence_ablation_all_gt: bool = False,
+    logmd: bool = False,
+    save_intermediate_predictions: bool = False,
+    save_intermediate_confidence: bool = False,
+    save_perturbed_confidence: bool = False,
+    confidence_perturbation_scale: float = 0.25,
 ) -> None:
     """Run predictions with Boltz."""
     # If cpu, write a friendly warning
     if accelerator == "cpu":
         msg = "Running on CPU, this will be slow. Consider using a GPU."
         click.echo(msg)
-
-    # Supress some lightning warnings
-    warnings.filterwarnings(
-        "ignore", ".*that has Tensor Cores. To properly utilize them.*"
-    )
 
     # Set no grad
     torch.set_grad_enabled(False)
@@ -1102,31 +1191,14 @@ def predict(  # noqa: C901, PLR0915, PLR0912
     if seed is not None:
         seed_everything(seed)
 
-    for key in ["CUEQ_DEFAULT_CONFIG", "CUEQ_DISABLE_AOT_TUNING"]:
-        # Disable kernel tuning by default,
-        # but do not modify envvar if already set by caller
-        os.environ[key] = os.environ.get(key, "1")
+    # Set no_trifast=True when on CPU
+    if accelerator == "cpu":
+        no_trifast = True
+    use_kernels = not no_trifast
 
     # Set cache path
     cache = Path(cache).expanduser()
     cache.mkdir(parents=True, exist_ok=True)
-
-    # Get MSA server credentials from environment variables if not provided
-    if use_msa_server:
-        if msa_server_username is None:
-            msa_server_username = os.environ.get("BOLTZ_MSA_USERNAME")
-        if msa_server_password is None:
-            msa_server_password = os.environ.get("BOLTZ_MSA_PASSWORD")
-        if api_key_value is None:
-            api_key_value = os.environ.get("MSA_API_KEY_VALUE")
-        
-        click.echo(f"MSA server enabled: {msa_server_url}")
-        if api_key_value:
-            click.echo("MSA server authentication: using API key header")
-        elif msa_server_username and msa_server_password:
-            click.echo("MSA server authentication: using basic auth")
-        else:
-            click.echo("MSA server authentication: no credentials provided")
 
     # Create output directories
     data = Path(data).expanduser()
@@ -1134,10 +1206,15 @@ def predict(  # noqa: C901, PLR0915, PLR0912
     out_dir = out_dir / f"boltz_results_{data.stem}"
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    # Save terminal output to log.txt
+    log_file = (out_dir / "log.txt").open("w")
+    sys.stdout = Tee(sys.stdout, log_file)
+    sys.stderr = Tee(sys.stderr, log_file)
+
     # Download necessary data and model
-    if model == "boltz1":
+    if (model == "boltz1") or use_boltz1_confidence_steering:
         download_boltz1(cache)
-    elif model == "boltz2":
+    elif (model == "boltz2") or use_boltz2_confidence_steering:
         download_boltz2(cache)
     else:
         msg = f"Model {model} not supported. Supported: boltz1, boltz2."
@@ -1159,7 +1236,7 @@ def predict(  # noqa: C901, PLR0915, PLR0912
     # Process inputs
     ccd_path = cache / "ccd.pkl"
     mol_dir = cache / "mols"
-    process_inputs(
+    manifest: Manifest = process_inputs(
         data=data,
         out_dir=out_dir,
         ccd_path=ccd_path,
@@ -1167,27 +1244,60 @@ def predict(  # noqa: C901, PLR0915, PLR0912
         use_msa_server=use_msa_server,
         msa_server_url=msa_server_url,
         msa_pairing_strategy=msa_pairing_strategy,
-        msa_server_username=msa_server_username,
-        msa_server_password=msa_server_password,
-        api_key_header=api_key_header,
-        api_key_value=api_key_value,
         boltz2=model == "boltz2",
         preprocessing_threads=preprocessing_threads,
         max_msa_seqs=max_msa_seqs,
+        standardize_smiles=True,
     )
 
-    # Load manifest
-    manifest = Manifest.load(out_dir / "processed" / "manifest.json")
+    use_boltz1_confidence_steering = use_boltz1_confidence_steering or use_boltz1_trunk_features
+    if use_boltz1_confidence_steering:
+        process_inputs(
+            data=data,
+            out_dir=out_dir,
+            ccd_path=ccd_path,
+            mol_dir=mol_dir,
+            use_msa_server=use_msa_server,
+            msa_server_url=msa_server_url,
+            msa_pairing_strategy=msa_pairing_strategy,
+            boltz2=False,
+            preprocessing_threads=preprocessing_threads,
+            max_msa_seqs=max_msa_seqs,
+            output_subdirectory="processed_boltz1",
+            standardize_smiles=True,
+        )
+
+    use_boltz2_confidence_steering = use_boltz2_confidence_steering or use_boltz2_trunk_features
+    if use_boltz2_confidence_steering:
+        process_inputs(
+            data=data,
+            out_dir=out_dir,
+            ccd_path=ccd_path,
+            mol_dir=mol_dir,
+            use_msa_server=use_msa_server,
+            msa_server_url=msa_server_url,
+            msa_pairing_strategy=msa_pairing_strategy,
+            boltz2=True,
+            preprocessing_threads=preprocessing_threads,
+            max_msa_seqs=max_msa_seqs,
+            output_subdirectory="processed_boltz2",
+            standardize_smiles=True,
+        )
+
+    if "seed" in str(out_dir.parent.name):
+        base_dir = out_dir.parent.parent / out_dir.name
+    else:
+        base_dir = out_dir
 
     # Filter out existing predictions
     filtered_manifest = filter_inputs_structure(
         manifest=manifest,
-        outdir=out_dir,
+        outdir=base_dir,
         override=override,
     )
 
     # Load processed data
-    processed_dir = out_dir / "processed"
+    processed_dir = base_dir / "processed"
     processed = BoltzProcessedInput(
         manifest=filtered_manifest,
         targets_dir=processed_dir / "structures",
@@ -1212,7 +1322,7 @@ def predict(  # noqa: C901, PLR0915, PLR0912
     if (isinstance(devices, int) and devices > 1) or (
         isinstance(devices, list) and len(devices) > 1
     ):
-        start_method = "fork" if platform.system() != "win32" and platform.system() != "Windows" else "spawn"
+        start_method = "fork" if platform.system() != "win32" else "spawn"
         strategy = DDPStrategy(start_method=start_method)
         if len(filtered_manifest.records) < devices:
             msg = (
@@ -1230,18 +1340,25 @@ def predict(  # noqa: C901, PLR0915, PLR0912
         diffusion_params = Boltz2DiffusionParams()
         step_scale = 1.5 if step_scale is None else step_scale
         diffusion_params.step_scale = step_scale
-        pairformer_args = PairformerArgsV2()
+        pairformer_args = PairformerArgsV2(
+            # dropout=dropout
+        )
     else:
         diffusion_params = BoltzDiffusionParams()
         step_scale = 1.638 if step_scale is None else step_scale
         diffusion_params.step_scale = step_scale
-        pairformer_args = PairformerArgs()
+        pairformer_args = PairformerArgs(
+            # dropout=dropout
+        )
 
     msa_args = MSAModuleArgs(
         subsample_msa=subsample_msa,
         num_subsampled_msa=num_subsampled_msa,
         use_paired_feature=model == "boltz2",
+        # msa_dropout=dropout,
+        # z_dropout=dropout,
     )
+    print(f"msa_args: {msa_args}")
 
     # Create prediction writer
     pred_writer = BoltzWriter(
@@ -1249,7 +1366,6 @@ def predict(  # noqa: C901, PLR0915, PLR0912
         output_dir=out_dir / "predictions",
         output_format=output_format,
         boltz2=model == "boltz2",
-        write_embeddings=write_embeddings,
     )
 
     # Set up trainer
@@ -1259,7 +1375,8 @@ def predict(  # noqa: C901, PLR0915, PLR0912
         callbacks=[pred_writer],
         accelerator=accelerator,
         devices=devices,
-        precision=32 if model == "boltz1" else "bf16-mixed",
+        precision="bf16-mixed", #32 if model == "boltz1" else "bf16-mixed",
+        inference_mode=not confidence_steering,
     )
 
     if filtered_manifest.records:
@@ -1269,6 +1386,15 @@ def predict(  # noqa: C901, PLR0915, PLR0912
 
         # Create data module
         if model == "boltz2":
+            if "seed" in str(out_dir.parent.name):
+                base_dir = out_dir.parent.parent / out_dir.name
+            else:
+                base_dir = out_dir
+            boltz1_target_dir = (
+                base_dir / "processed_boltz1" / "structures"
+                if use_boltz1_confidence_steering
+                else None
+            )
             data_module = Boltz2InferenceDataModule(
                 manifest=processed.manifest,
                 target_dir=processed.targets_dir,
@@ -1279,14 +1405,28 @@ def predict(  # noqa: C901, PLR0915, PLR0912
                 template_dir=processed.template_dir,
                 extra_mols_dir=processed.extra_mols_dir,
                 override_method=method,
+                use_boltz1_confidence_steering=use_boltz1_confidence_steering,
+                boltz1_target_dir=boltz1_target_dir,
             )
         else:
+            if "seed" in str(out_dir.parent.name):
+                base_dir = out_dir.parent.parent / out_dir.name
+            else:
+                base_dir = out_dir
+            boltz2_target_dir = (
+                base_dir / "processed_boltz2" / "structures"
+                if use_boltz2_confidence_steering
+                else None
+            )
             data_module = BoltzInferenceDataModule(
                 manifest=processed.manifest,
                 target_dir=processed.targets_dir,
                 msa_dir=processed.msa_dir,
                 num_workers=num_workers,
                 constraints_dir=processed.constraints_dir,
+                mol_dir=mol_dir,
+                use_boltz2_confidence_steering=use_boltz2_confidence_steering,
+                boltz2_target_dir=boltz2_target_dir,
             )
 
         # Load model
@@ -1296,34 +1436,101 @@ def predict(  # noqa: C901, PLR0915, PLR0912
             else:
                 checkpoint = cache / "boltz1_conf.ckpt"
 
-        predict_args = {
+        predict_args = { 
             "recycling_steps": recycling_steps,
+            "s_z_samples": s_z_samples,
             "sampling_steps": sampling_steps,
             "diffusion_samples": diffusion_samples,
             "max_parallel_samples": max_parallel_samples,
+            "max_multiplicity": max_multiplicity,
+            "superposition": not no_superposition,
             "write_confidence_summary": True,
             "write_full_pae": write_full_pae,
             "write_full_pde": write_full_pde,
+            "structure_ablation": structure_ablation,
+            "confidence_ablation": confidence_ablation,
+            "confidence_ablation_all_gt": confidence_ablation_all_gt,
         }
 
         steering_args = BoltzSteeringParams()
-        steering_args.fk_steering = use_potentials
-        steering_args.physical_guidance_update = use_potentials
+        print(f"use_potentials: {use_potentials}")
+        if not use_potentials:
+            steering_args.fk_steering = False
+            steering_args.guidance_update = False
+        steering_args.use_potentials = use_potentials
+        steering_args.use_openmm_energy = use_openmm_energy
+        steering_args.use_rosetta_energy = use_rosetta_energy
+        print(f"confidence_steering: {confidence_steering}")
+        if steering_args.use_openmm_energy or steering_args.use_rosetta_energy:
+            steering_args.fk_steering = True
+            steering_args.guidance_update = True
+            steering_args.targets_dir = processed.targets_dir
+        if confidence_steering:
+            steering_args.fk_steering = True
+            steering_args.guidance_update = True
+            steering_args.use_confidence = True
+            steering_args.confidence_s_z_samples = min(steering_args.confidence_s_z_samples, s_z_samples)
+        steering_args.use_boltz1_confidence_steering = use_boltz1_confidence_steering
+        steering_args.use_boltz1_trunk_features = use_boltz1_trunk_features
+        steering_args.use_boltz2_confidence_steering = use_boltz2_confidence_steering
+        steering_args.use_boltz2_trunk_features = use_boltz2_trunk_features
+        steering_args.use_dropout = use_confidence_dropout_steering
+        steering_args.dropout_samples = steering_args.dropout_samples if use_confidence_dropout_steering else 1
+        
+        logmd_args = LogMDParams(
+            logmd=logmd,
+            save_intermediate_predictions=save_intermediate_predictions or save_intermediate_confidence,
+            save_intermediate_confidence=save_intermediate_confidence,
+            save_perturbed_confidence=save_perturbed_confidence,
+            confidence_perturbation_scale=confidence_perturbation_scale,
+            targets_dir=processed.targets_dir,
+            prediction_dir=out_dir / "predictions" / "logmd",
+        )
 
         model_cls = Boltz2 if model == "boltz2" else Boltz1
+
+        model_init_kwargs = {
+            "predict_args": predict_args,
+            "map_location": "cpu",
+            "diffusion_process_args": asdict(diffusion_params),
+            "ema": False,
+            "use_kernels": use_kernels,
+            "use_dropout": use_dropout,
+            "pairformer_args": asdict(pairformer_args),
+            "msa_args": asdict(msa_args),
+            "steering_args": asdict(steering_args),
+            "logmd_args": asdict(logmd_args),
+        }
+
+        if model == "boltz2":
+            if use_boltz1_confidence_steering:
+                model_init_kwargs["boltz1_checkpoint"] = str(cache / "boltz1_conf.ckpt")
+                
+            else:
+                model_init_kwargs["boltz1_checkpoint"] = None
+        elif model == "boltz1":
+            model_init_kwargs["boltz2_checkpoint"] = (
+                str(cache / "boltz2_conf.ckpt")
+                if use_boltz2_confidence_steering
+                else None
+            )
+
+        # Save model_init_kwargs as JSON
+        model_kwargs_path = out_dir / "model_init_kwargs.json"
+        with open(model_kwargs_path, "w") as f:
+            json.dump(model_init_kwargs, f, indent=2, default=str)
+        click.echo(f"Saved model_init_kwargs to {model_kwargs_path}")
+
         model_module = model_cls.load_from_checkpoint(
             checkpoint,
             strict=True,
-            predict_args=predict_args,
-            map_location="cpu",
-            diffusion_process_args=asdict(diffusion_params),
-            ema=False,
-            use_kernels=not no_kernels,
-            pairformer_args=asdict(pairformer_args),
-            msa_args=asdict(msa_args),
-            steering_args=asdict(steering_args),
+            **model_init_kwargs,
         )
         model_module.eval()
+        if use_dropout:
+            for module in model_module.modules():
+                if isinstance(module, nn.Dropout):
+                    module.dropout.train()
 
         # Compute structure predictions
         trainer.predict(
@@ -1383,11 +1590,6 @@ def predict(  # noqa: C901, PLR0915, PLR0912
         if affinity_checkpoint is None:
             affinity_checkpoint = cache / "boltz2_aff.ckpt"
 
-        steering_args = BoltzSteeringParams()
-        steering_args.fk_steering = False
-        steering_args.physical_guidance_update = False
-        steering_args.contact_guidance_update = False
-        
         model_module = Boltz2.load_from_checkpoint(
             affinity_checkpoint,
             strict=True,
@@ -1397,7 +1599,7 @@ def predict(  # noqa: C901, PLR0915, PLR0912
             ema=False,
             pairformer_args=asdict(pairformer_args),
             msa_args=asdict(msa_args),
-            steering_args=asdict(steering_args),
+            steering_args={"fk_steering": False, "guidance_update": False},
             affinity_mw_correction=affinity_mw_correction,
         )
         model_module.eval()

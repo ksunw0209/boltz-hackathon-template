@@ -112,7 +112,7 @@ def compute_frame_pred(
     return frames_idx_pred, mask_collinear_pred * feats["token_pad_mask"][:, None, :]
 
 
-def compute_aggregated_metric(logits, end=1.0):
+def compute_aggregated_metric(logits, end=1.0, return_uncertainty=False):
     # Compute aggregated metric from logits
     num_bins = logits.shape[-1]
     bin_width = end / num_bins
@@ -124,7 +124,16 @@ def compute_aggregated_metric(logits, end=1.0):
         probs * bounds.view(*((1,) * len(probs.shape[:-1])), *bounds.shape),
         dim=-1,
     )
-    return plddt
+    plddt_std = torch.sqrt(torch.sum(
+        probs * (bounds ** 2).view(*((1,) * len(probs.shape[:-1])), *bounds.shape),
+        dim=-1,
+    ) - plddt ** 2)
+    plddt_entropy = -torch.sum(probs * torch.log(probs + 1e-8), dim=-1)
+
+    if return_uncertainty:
+        return plddt, plddt_std, plddt_entropy
+    else:
+        return plddt
 
 
 def tm_function(d, Nres):
@@ -154,6 +163,19 @@ def compute_ptms(logits, x_preds, feats, multiplicity):
     pae_value = torch.arange(
         start=0.5 * bin_width, end=end, step=bin_width, device=logits.device
     ).unsqueeze(0)
+
+    # Compute ipAE
+    pae, pae_std, pae_entropy = compute_aggregated_metric(logits, end=end, return_uncertainty=True)
+    complex_ipae = (pae * pair_mask_iptm).sum(dim=(1, 2)) / (
+        pair_mask_iptm.sum(dim=(1, 2)) + 1e-5
+    )
+    complex_ipae_std = (pae_std * pair_mask_iptm).sum(dim=(1, 2)) / (
+        pair_mask_iptm.sum(dim=(1, 2)) + 1e-5
+    )
+    complex_ipae_entropy = (pae_entropy * pair_mask_iptm).sum(dim=(1, 2)) / (
+        pair_mask_iptm.sum(dim=(1, 2)) + 1e-5
+    )
+
     N_res = mask_pad.sum(dim=-1, keepdim=True)
     tm_value = tm_function(pae_value, N_res).unsqueeze(1).unsqueeze(2)
     probs = nn.functional.softmax(logits, dim=-1)
@@ -228,4 +250,32 @@ def compute_ptms(logits, x_preds, feats, multiplicity):
             ).values
         chain_pair_iptm[idx1] = chain_iptm
 
-    return ptm, iptm, ligand_iptm, protein_iptm, chain_pair_iptm
+    # Compute ptm/iptm energy
+    tm_value_log = torch.log(tm_value + 1e-8)
+    # This is a log-space expectation of the TM-score.
+    # It can be seen as a free energy of a system where the states
+    # are the distance bins and the energies are modified by the tm_value.
+    tm_energy = -torch.logsumexp(logits + tm_value_log, dim=-1)
+
+    ptm_energy_num = torch.sum(tm_energy * pair_mask_ptm, dim=(1, 2))
+    ptm_energy_den = torch.sum(pair_mask_ptm, dim=(1, 2))
+    ptm_energy = ptm_energy_num / (ptm_energy_den + 1e-5)
+    iptm_energy_num = torch.sum(tm_energy * pair_mask_iptm, dim=(1, 2))
+    iptm_energy_den = torch.sum(pair_mask_iptm, dim=(1, 2))
+    iptm_energy = iptm_energy_num / (iptm_energy_den + 1e-5)
+
+    return (
+        ptm,
+        iptm,
+        ligand_iptm,
+        protein_iptm,
+        chain_pair_iptm,
+        ptm_energy,
+        iptm_energy,
+        pae,
+        pae_std,
+        pae_entropy,
+        complex_ipae,
+        complex_ipae_std,
+        complex_ipae_entropy,
+    )

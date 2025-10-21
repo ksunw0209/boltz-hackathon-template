@@ -1,7 +1,13 @@
-name: boltzplatz
+name: boltz
 channels:
   - conda-forge
+  - https://conda.rosettacommons.org
 dependencies:
   - python=3.11
   - pip
   - pymol-open-source
+  - pyrosetta=2025.42
+  - openmm[cuda12]
+  - pdbfixer
+  - pip:
+    - dataclasses-json

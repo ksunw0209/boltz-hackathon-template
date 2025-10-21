@@ -1,6 +1,8 @@
 import torch
 from torch import nn
 from torch.nn.functional import pad
+import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 
 import boltz.model.layers.initialize as init
 from boltz.data import const
@@ -15,6 +17,12 @@ from boltz.model.modules.trunkv2 import (
 )
 from boltz.model.modules.utils import LinearNoBias
 
+def move_to_cpu(obj):
+    if isinstance(obj, torch.Tensor):
+        return obj.cpu()
+    elif isinstance(obj, dict):
+        return {k: move_to_cpu(v) for k, v in obj.items()}
+    return obj
 
 class ConfidenceModule(nn.Module):
     """Algorithm 31"""
@@ -84,7 +92,9 @@ class ConfidenceModule(nn.Module):
             )
             self.bond_type_feature = bond_type_feature
             if bond_type_feature:
-                self.token_bonds_type = nn.Embedding(len(const.bond_types) + 1, token_z)
+                self.token_bonds_type = nn.Embedding(
+                    len(const.bond_types) + 1, token_z
+                )
 
             self.contact_conditioning = ContactConditioning(
                 token_z=token_z,
@@ -117,24 +127,56 @@ class ConfidenceModule(nn.Module):
         multiplicity=1,
         run_sequentially=False,
         use_kernels: bool = False,
+        differentiable: bool = False,
+        tau: float = 1.0,
+        use_dropout: bool = False,
     ):
         if run_sequentially and multiplicity > 1:
-            assert z.shape[0] == 1, "Not supported with batch size > 1"
             out_dicts = []
-            for sample_idx in range(multiplicity):
-                out_dicts.append(  # noqa: PERF401
-                    self.forward(
+
+            if z.shape[0] == 1:
+                output_on_cpu = x_pred.device.type == "cpu"
+                for sample_idx in range(multiplicity):
+                    confidence_out = self.forward(
                         s_inputs,
                         s,
                         z,
-                        x_pred[sample_idx : sample_idx + 1],
+                        x_pred[sample_idx : sample_idx + 1] if not output_on_cpu else x_pred[sample_idx : sample_idx + 1].to(s.device),
                         feats,
                         pred_distogram_logits,
                         multiplicity=1,
                         run_sequentially=False,
                         use_kernels=use_kernels,
+                        differentiable=differentiable,
+                        tau=tau,
+                        use_dropout=use_dropout,
                     )
-                )
+                    if output_on_cpu:
+                        x_pred = x_pred.cpu() # save memory for large multiplicity
+                        out_dicts.append(move_to_cpu(confidence_out))
+                    else:
+                        out_dicts.append(confidence_out)
+            else:
+                assert s.shape[0] == multiplicity, "s.shape[0] must be equal to multiplicity"
+                assert z.shape[0] == multiplicity, "z.shape[0] must be equal to multiplicity"
+                assert pred_distogram_logits.shape[3] == multiplicity, "pred_distogram_logits.shape[3] must be equal to multiplicity"
+                for sample_idx in range(multiplicity):
+                    out_dicts.append(  # noqa: PERF401
+                        self.forward(
+                            s_inputs,
+                            s[sample_idx : sample_idx + 1],
+                            z[sample_idx : sample_idx + 1],
+                            x_pred[sample_idx : sample_idx + 1],
+                            feats,
+                            pred_distogram_logits[:, :, :, sample_idx: sample_idx + 1],
+                            multiplicity=1,
+                            run_sequentially=False,
+                            use_kernels=use_kernels,
+                            differentiable=differentiable,
+                            tau=tau,
+                            use_dropout=use_dropout,
+                        )
+                    )
 
             out_dict = {}
             for key in out_dicts[0]:
@@ -195,15 +237,52 @@ class ConfidenceModule(nn.Module):
             BM, N, _ = x_pred.shape
         x_pred_repr = torch.bmm(token_to_rep_atom.float(), x_pred)
         d = torch.cdist(x_pred_repr, x_pred_repr)
-        distogram = (d.unsqueeze(-1) > self.boundaries).sum(dim=-1).long()
-        distogram = self.dist_bin_pairwise_embed(distogram)
+        distogram_ref_idx = (d.unsqueeze(-1) > self.boundaries).sum(dim=-1).long()
+        distogram_ref = self.dist_bin_pairwise_embed(distogram_ref_idx)
+        if differentiable:
+            bin_size = self.boundaries[1] - self.boundaries[0]
+            mid_points = torch.linspace(
+                self.boundaries[0] - bin_size / 2,
+                self.boundaries[-1] + bin_size / 2,
+                len(self.boundaries) + 1,
+                device=d.device,
+            )
+            distogram_logits = (
+                -torch.abs(d.unsqueeze(-1) - mid_points) / tau
+            )  # Note: tau is temperature for distance logit, not gumbel-softmax!
+
+            #### Straight-through estimator ####
+            distogram_soft = F.softmax(distogram_logits, dim=-1)
+            index = distogram_soft.max(dim=-1, keepdim=True)[1]
+            distogram_onehot = torch.zeros_like(
+                distogram_soft, memory_format=torch.legacy_contiguous_format
+            ).scatter_(-1, index, 1.0)
+            distogram_onehot = (
+                distogram_onehot - distogram_soft.detach() + distogram_soft
+            )
+
+            assert (
+                self.dist_bin_pairwise_embed.max_norm is None
+            )  # if not, forward pass modifies the embedding weight in-place
+            distogram = torch.einsum(
+                "bkli, ij->bklj", distogram_onehot, self.dist_bin_pairwise_embed.weight
+            )
+        else:
+            distogram = distogram_ref
+
         z = z + distogram
 
         mask = feats["token_pad_mask"].repeat_interleave(multiplicity, 0)
         pair_mask = mask[:, :, None] * mask[:, None, :]
 
         s_t, z_t = self.pairformer_stack(
-            s, z, mask=mask, pair_mask=pair_mask, use_kernels=use_kernels
+            s,
+            z,
+            mask=mask,
+            pair_mask=pair_mask,
+            use_kernels=use_kernels,
+            use_checkpoint=differentiable,
+            use_dropout=use_dropout,
         )
 
         # AF3 has residual connections, we remove them
@@ -288,11 +367,13 @@ class ConfidenceHeads(nn.Module):
 
         if self.use_separate_heads:
             pae_intra_logits = self.to_pae_intra_logits(z)
-            pae_intra_logits = pae_intra_logits * is_same_chain.float().unsqueeze(-1)
+            pae_intra_logits = pae_intra_logits * is_same_chain.float().unsqueeze(
+                -1
+            )
 
             pae_inter_logits = self.to_pae_inter_logits(z)
-            pae_inter_logits = pae_inter_logits * is_different_chain.float().unsqueeze(
-                -1
+            pae_inter_logits = (
+                pae_inter_logits * is_different_chain.float().unsqueeze(-1)
             )
 
             pae_logits = pae_inter_logits + pae_intra_logits
@@ -473,10 +554,9 @@ class ConfidenceHeads(nn.Module):
             complex_ipde=complex_ipde,
         )
         out_dict["pae_logits"] = pae_logits
-        out_dict["pae"] = compute_aggregated_metric(pae_logits, end=32)
 
         try:
-            ptm, iptm, ligand_iptm, protein_iptm, pair_chains_iptm = compute_ptms(
+            ptm, iptm, ligand_iptm, protein_iptm, pair_chains_iptm, ptm_energy, iptm_energy, pae, pae_std, pae_entropy, complex_ipae, complex_ipae_std, complex_ipae_entropy = compute_ptms(
                 pae_logits, x_pred, feats, multiplicity
             )
             out_dict["ptm"] = ptm
@@ -484,6 +564,14 @@ class ConfidenceHeads(nn.Module):
             out_dict["ligand_iptm"] = ligand_iptm
             out_dict["protein_iptm"] = protein_iptm
             out_dict["pair_chains_iptm"] = pair_chains_iptm
+            out_dict["ptm_energy"] = ptm_energy
+            out_dict["iptm_energy"] = iptm_energy
+            out_dict["pae"] = pae
+            out_dict["pae_std"] = pae_std
+            out_dict["pae_entropy"] = pae_entropy
+            out_dict["complex_ipae"] = complex_ipae
+            out_dict["complex_ipae_std"] = complex_ipae_std
+            out_dict["complex_ipae_entropy"] = complex_ipae_entropy
         except Exception as e:
             print(f"Error in compute_ptms: {e}")
             out_dict["ptm"] = torch.zeros_like(complex_plddt)
@@ -491,5 +579,13 @@ class ConfidenceHeads(nn.Module):
             out_dict["ligand_iptm"] = torch.zeros_like(complex_plddt)
             out_dict["protein_iptm"] = torch.zeros_like(complex_plddt)
             out_dict["pair_chains_iptm"] = torch.zeros_like(complex_plddt)
+            out_dict["ptm_energy"] = torch.zeros_like(complex_plddt)
+            out_dict["iptm_energy"] = torch.zeros_like(complex_plddt)
+            out_dict["pae"] = compute_aggregated_metric(pae_logits, end=32)
+            out_dict["pae_std"] = torch.zeros_like(complex_plddt)
+            out_dict["pae_entropy"] = torch.zeros_like(complex_plddt)
+            out_dict["complex_ipae"] = torch.zeros_like(complex_plddt)
+            out_dict["complex_ipae_std"] = torch.zeros_like(complex_plddt)
+            out_dict["complex_ipae_entropy"] = torch.zeros_like(complex_plddt)
 
         return out_dict

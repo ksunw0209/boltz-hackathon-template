@@ -4,12 +4,269 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 from collections.abc import Iterable
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from typing import Any, List, Optional
+from typing import Any, List, Optional, Tuple
 
 import yaml
 from hackathon_api import Datapoint, Protein, SmallMolecule
+
+# Add src to path for importing verifiers
+project_root = Path(__file__).resolve().parent.parent
+src_path = project_root / 'src'
+sys.path.insert(0, str(src_path))
+
+from boltz.model.verifiers.openmm_energy import OpenMMInteractionEnergy
+from boltz.model.verifiers.rosetta_energy import RosettaInteractionEnergy
+from openmm.unit import kilojoules_per_mole
+
+# ---------------------------------------------------------------------------
+# ---- Helper functions for multi-metric ranking -----------------------------
+# ---------------------------------------------------------------------------
+
+def _load_confidence_scores(pdb_path: Path) -> Tuple[Optional[float], Optional[float]]:
+    """
+    Load iptm and iptm_boltz1 scores from confidence JSON file.
+    
+    Args:
+        pdb_path: Path to the PDB file
+        
+    Returns:
+        Tuple of (iptm_score, iptm_boltz1_score) - either can be None if not found
+    """
+    print(f"  [Confidence] Loading confidence scores for {pdb_path.name}")
+    
+    try:
+        # Construct confidence file path
+        pdb_name = pdb_path.stem  # e.g., "8CYH_config_3_model_0"
+        confidence_file = pdb_path.parent / f"confidence_{pdb_name}.json"
+        
+        print(f"  [Confidence] Looking for confidence file: {confidence_file}")
+        
+        if not confidence_file.exists():
+            print(f"  [Confidence] WARNING: Confidence file not found")
+            return None, None
+            
+        print(f"  [Confidence] Confidence file found, loading...")
+        with open(confidence_file, 'r') as f:
+            confidence_data = json.load(f)
+            
+        iptm_score = confidence_data.get('iptm')
+        iptm_boltz1_score = confidence_data.get('iptm_boltz1')
+        
+        print(f"  [Confidence] iptm score: {iptm_score}")
+        print(f"  [Confidence] iptm_boltz1 score: {iptm_boltz1_score}")
+        
+        return iptm_score, iptm_boltz1_score
+        
+    except Exception as e:
+        print(f"  [Confidence] ERROR: Could not load confidence scores for {pdb_path.name}")
+        print(f"  [Confidence] Exception type: {type(e).__name__}")
+        print(f"  [Confidence] Exception message: {str(e)}")
+        return None, None
+
+def _calculate_openmm_energy(pdb_path: Path) -> Optional[float]:
+    """
+    Calculate OpenMM interaction energy per residue.
+    
+    Args:
+        pdb_path: Path to the PDB file
+        
+    Returns:
+        interaction_energy_per_residue if successful, None otherwise
+    """
+    print(f"  [OpenMM] Starting energy calculation for {pdb_path.name}")
+    
+    try:
+        # Check if OpenMM is available by trying to access the class
+        try:
+            # Try to access the imported class
+            energy_calculator = OpenMMInteractionEnergy()
+            print(f"  [OpenMM] OpenMMInteractionEnergy class available, proceeding...")
+        except NameError:
+            print(f"  [OpenMM] ERROR: OpenMMInteractionEnergy class not available")
+            return None
+            
+        # Check if result already exists
+        pdb_name = pdb_path.stem
+        energy_file = pdb_path.parent / f"openmm_energy_{pdb_name}.json"
+        
+        if energy_file.exists():
+            print(f"  [OpenMM] Found existing energy file: {energy_file}")
+            with open(energy_file, 'r') as f:
+                energy_data = json.load(f)
+            result = energy_data.get('interaction_energy_per_residue_kj_mol')
+            print(f"  [OpenMM] Loaded cached result: {result}")
+            return result
+        
+        print(f"  [OpenMM] No cached result found, calculating energy...")
+        print(f"  [OpenMM] PDB file path: {pdb_path}")
+        print(f"  [OpenMM] PDB file exists: {pdb_path.exists()}")
+        
+        # Calculate energy
+        print(f"  [OpenMM] Creating OpenMMInteractionEnergy calculator...")
+        energy_calculator = OpenMMInteractionEnergy()
+        print(f"  [OpenMM] Calculator created successfully")
+        
+        print(f"  [OpenMM] Calling calculate_interaction_energy with CUDA platform...")
+        energy_results = energy_calculator.calculate_interaction_energy(
+            pdb_file_path=str(pdb_path),
+            platform_name='CUDA'  # Default to CUDA, fallback handled by OpenMM
+        )
+        print(f"  [OpenMM] Energy calculation completed successfully")
+        print(f"  [OpenMM] Results keys: {list(energy_results.keys())}")
+        
+        # Extract interaction energy per residue
+        interaction_energy_per_residue = energy_results['interaction_energy_per_residue'].value_in_unit(kilojoules_per_mole)
+        print(f"  [OpenMM] Interaction energy per residue: {interaction_energy_per_residue} kJ/mol")
+        
+        # Save results
+        result_data = {
+            'interaction_energy_per_residue_kj_mol': interaction_energy_per_residue,
+            'complex_energy_kj_mol': energy_results['complex_energy'].value_in_unit(kilojoules_per_mole),
+            'interaction_energy_kj_mol': energy_results['interaction_energy'].value_in_unit(kilojoules_per_mole),
+            'complex_energy_per_residue_kj_mol': energy_results['complex_energy_per_residue'].value_in_unit(kilojoules_per_mole)
+        }
+        
+        print(f"  [OpenMM] Saving results to: {energy_file}")
+        with open(energy_file, 'w') as f:
+            json.dump(result_data, f, indent=2)
+        print(f"  [OpenMM] Results saved successfully")
+            
+        return interaction_energy_per_residue
+        
+    except Exception as e:
+        print(f"  [OpenMM] ERROR: Exception during energy calculation for {pdb_path.name}")
+        print(f"  [OpenMM] Exception type: {type(e).__name__}")
+        print(f"  [OpenMM] Exception message: {str(e)}")
+        import traceback
+        print(f"  [OpenMM] Full traceback:")
+        traceback.print_exc()
+        return None
+
+def _calculate_rosetta_energy(pdb_path: Path) -> Optional[float]:
+    """
+    Calculate Rosetta interaction energy per residue.
+    
+    Args:
+        pdb_path: Path to the PDB file
+        
+    Returns:
+        interaction_energy_per_residue if successful, None otherwise
+    """
+    print(f"  [Rosetta] Starting energy calculation for {pdb_path.name}")
+    
+    try:
+        # Check if Rosetta is available by trying to access the class
+        try:
+            # Try to access the imported class
+            energy_calculator = RosettaInteractionEnergy()
+            print(f"  [Rosetta] RosettaInteractionEnergy class available, proceeding...")
+        except NameError:
+            print(f"  [Rosetta] ERROR: RosettaInteractionEnergy class not available")
+            return None
+            
+        # Check if result already exists
+        pdb_name = pdb_path.stem
+        energy_file = pdb_path.parent / f"rosetta_energy_{pdb_name}.json"
+        
+        if energy_file.exists():
+            print(f"  [Rosetta] Found existing energy file: {energy_file}")
+            with open(energy_file, 'r') as f:
+                energy_data = json.load(f)
+            result = energy_data.get('interaction_energy_per_residue_reu')
+            print(f"  [Rosetta] Loaded cached result: {result}")
+            return result
+        
+        print(f"  [Rosetta] No cached result found, calculating energy...")
+        print(f"  [Rosetta] PDB file path: {pdb_path}")
+        print(f"  [Rosetta] PDB file exists: {pdb_path.exists()}")
+        
+        # Calculate energy
+        print(f"  [Rosetta] Creating RosettaInteractionEnergy calculator...")
+        energy_calculator = RosettaInteractionEnergy()
+        print(f"  [Rosetta] Calculator created successfully")
+        
+        print(f"  [Rosetta] Calling calculate_interaction_energy...")
+        energy_results = energy_calculator.calculate_interaction_energy(
+            pdb_file_path=str(pdb_path)
+        )
+        print(f"  [Rosetta] Energy calculation completed successfully")
+        print(f"  [Rosetta] Results keys: {list(energy_results.keys())}")
+        
+        # Extract interaction energy per residue
+        interaction_energy_per_residue = energy_results['interaction_energy_per_residue']
+        print(f"  [Rosetta] Interaction energy per residue: {interaction_energy_per_residue} REU")
+        
+        # Save results
+        result_data = {
+            'interaction_energy_per_residue_reu': interaction_energy_per_residue,
+            'complex_energy_reu': energy_results['complex_energy'],
+            'interaction_energy_reu': energy_results['interaction_energy'],
+            'complex_energy_per_residue_reu': energy_results['complex_energy_per_residue']
+        }
+        
+        print(f"  [Rosetta] Saving results to: {energy_file}")
+        with open(energy_file, 'w') as f:
+            json.dump(result_data, f, indent=2)
+        print(f"  [Rosetta] Results saved successfully")
+            
+        return interaction_energy_per_residue
+        
+    except Exception as e:
+        print(f"  [Rosetta] ERROR: Exception during energy calculation for {pdb_path.name}")
+        print(f"  [Rosetta] Exception type: {type(e).__name__}")
+        print(f"  [Rosetta] Exception message: {str(e)}")
+        import traceback
+        print(f"  [Rosetta] Full traceback:")
+        traceback.print_exc()
+        return None
+
+def _calculate_all_metrics(pdb_path: Path) -> Tuple[Path, float, List[str]]:
+    """
+    Calculate all available metrics for a single PDB file.
+    
+    Args:
+        pdb_path: Path to the PDB file
+        
+    Returns:
+        Tuple of (pdb_path, composite_score, metric_names)
+    """
+    scores = []
+    metric_names = []
+    
+    # Load confidence scores (iptm and iptm_boltz1)
+    iptm_score, iptm_boltz1_score = _load_confidence_scores(pdb_path)
+    
+    if iptm_score is not None:
+        scores.append(iptm_score)
+        metric_names.append("iptm")
+    
+    if iptm_boltz1_score is not None:
+        scores.append(iptm_boltz1_score)
+        metric_names.append("iptm_boltz1")
+    
+    # Calculate OpenMM energy
+    openmm_energy = _calculate_openmm_energy(pdb_path)
+    if openmm_energy is not None:
+        scores.append(-openmm_energy)  # Negate so lower energy = higher score
+        metric_names.append("openmm_energy")
+    
+    # Calculate Rosetta energy
+    rosetta_energy = _calculate_rosetta_energy(pdb_path)
+    if rosetta_energy is not None:
+        scores.append(-rosetta_energy)  # Negate so lower energy = higher score
+        metric_names.append("rosetta_energy")
+    
+    if not scores:
+        composite_score = 0.0
+    else:
+        # Simple average of available metrics
+        composite_score = sum(scores) / len(scores)
+    
+    return pdb_path, composite_score, metric_names
 
 # ---------------------------------------------------------------------------
 # ---- Participants should modify these four functions ----------------------
@@ -44,9 +301,21 @@ def prepare_protein_complex(datapoint_id: str, proteins: List[Protein], input_di
     #
     # will add contact constraints to the input_dict
 
-    # Example: predict 5 structures
-    cli_args = ["--diffusion_samples", "5"]
-    return [(input_dict, cli_args)]
+    # Generate multiple configurations with different seeds (0-3)
+    configs = []
+    for seed in range(4):  # seeds 0, 1, 2, 3
+        cli_args = [
+            "--diffusion_samples", "8", 
+            "--seed", str(seed), 
+            "--use_dropout",
+            "--use_boltz1_confidence_steering",
+            "--use_boltz1_trunk_features",
+            # "--subsample_msa",
+            # "--num_subsampled_msa", "128",
+        ]
+        configs.append((input_dict, cli_args))
+
+    return configs
 
 def prepare_protein_ligand(datapoint_id: str, protein: Protein, ligands: list[SmallMolecule], input_dict: dict, msa_dir: Optional[Path] = None) -> List[tuple[dict, List[str]]]:
     """
@@ -100,6 +369,72 @@ def post_process_protein_complex(datapoint: Datapoint, input_dicts: List[dict[st
     # Sort all PDBs and return their paths
     all_pdbs = sorted(all_pdbs)
     return all_pdbs
+
+def post_process_protein_complex_via_verifiers(datapoint: Datapoint, input_dicts: List[dict[str, Any]], cli_args_list: List[list[str]], prediction_dirs: List[Path], max_workers: int = 4) -> List[Path]:
+    """
+    Return ranked model files for protein complex submission using multiple quality metrics.
+    
+    This function ranks predictions using a combination of:
+    1. iptm score from confidence JSON files
+    2. iptm_boltz1 score from confidence JSON files (when available)
+    3. OpenMM interaction energy per residue (negated, so lower energy = higher score)
+    4. Rosetta interaction energy per residue (negated, so lower energy = higher score)
+    
+    Args:
+        datapoint: The original datapoint object
+        input_dicts: List of input dictionaries used for predictions (one per config)
+        cli_args_list: List of command line arguments used for predictions (one per config)
+        prediction_dirs: List of directories containing prediction results (one per config)
+        max_workers: Maximum number of threads to use for parallel energy calculations
+    Returns: 
+        Sorted pdb file paths ranked by composite quality score (best first).
+    """
+    # Collect all PDBs from all configurations
+    all_pdbs = []
+    for prediction_dir in prediction_dirs:
+        config_pdbs = sorted(prediction_dir.glob(f"{datapoint.datapoint_id}_config_*_model_*.pdb"))
+        all_pdbs.extend(config_pdbs)
+
+    if not all_pdbs:
+        print("Warning: No PDB files found for ranking")
+        return []
+
+    print(f"Ranking {len(all_pdbs)} PDB files using multi-metric scoring...")
+    print(f"Using {max_workers} parallel workers for energy calculations...")
+    
+    # Calculate scores for each PDB in parallel
+    pdb_scores = []
+    
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        # Submit all tasks
+        future_to_pdb = {executor.submit(_calculate_all_metrics, pdb_path): pdb_path for pdb_path in all_pdbs}
+        
+        # Collect results as they complete
+        for future in as_completed(future_to_pdb):
+            pdb_path = future_to_pdb[future]
+            try:
+                pdb_path_result, composite_score, metric_names = future.result()
+                pdb_scores.append((pdb_path_result, composite_score, metric_names))
+                
+                if metric_names:
+                    print(f"  ✓ {pdb_path.name}: score={composite_score:.4f} (metrics: {', '.join(metric_names)})")
+                else:
+                    print(f"  ⚠ {pdb_path.name}: score={composite_score:.4f} (no metrics available)")
+                    
+            except Exception as e:
+                print(f"  ✗ Error processing {pdb_path.name}: {e}")
+                # Add with default score
+                pdb_scores.append((pdb_path, 0.0, []))
+    
+    # Sort by composite score (descending - higher score is better)
+    pdb_scores.sort(key=lambda x: x[1], reverse=True)
+    
+    print(f"\nRanking results:")
+    for i, (pdb_path, score, metrics) in enumerate(pdb_scores):
+        print(f"  {i+1}. {pdb_path.name}: {score:.4f} ({', '.join(metrics)})")
+    
+    # Return sorted PDB paths
+    return [pdb_path for pdb_path, _, _ in pdb_scores]
 
 def post_process_protein_ligand(datapoint: Datapoint, input_dicts: List[dict[str, Any]], cli_args_list: List[list[str]], prediction_dirs: List[Path]) -> List[Path]:
     """
@@ -155,6 +490,8 @@ ap.add_argument("--group-id", type=str, required=False, default=None,
                 help="Group ID to set for submission directory (sets group rw access if specified)")
 ap.add_argument("--result-folder", type=Path, required=False, default=None,
                 help="Directory to save evaluation results. If set, will automatically run evaluation after predictions.")
+ap.add_argument("--max-workers", type=int, required=False, default=1,
+                help="Maximum number of parallel workers for energy calculations in multi-metric ranking (default: 1)")
 
 args = ap.parse_args()
 
@@ -241,7 +578,7 @@ def _run_boltz_and_collect(datapoint) -> None:
             "--devices", "1",
             "--out_dir", str(out_dir),
             "--cache", cache,
-            "--no_kernels",
+            # "--no_kernels",
             "--output_format", "pdb",
         ]
         cmd = fixed + cli_args
@@ -257,7 +594,8 @@ def _run_boltz_and_collect(datapoint) -> None:
 
     # Post-process and copy submissions
     if datapoint.task_type == "protein_complex":
-        ranked_files = post_process_protein_complex(datapoint, all_input_dicts, all_cli_args, all_pred_subfolders)
+        # Use the new multi-metric ranking function with parallel processing
+        ranked_files = post_process_protein_complex_via_verifiers(datapoint, all_input_dicts, all_cli_args, all_pred_subfolders, args.max_workers)
     elif datapoint.task_type == "protein_ligand":
         ranked_files = post_process_protein_ligand(datapoint, all_input_dicts, all_cli_args, all_pred_subfolders)
     else:
