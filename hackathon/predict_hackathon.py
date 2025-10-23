@@ -14,6 +14,13 @@ from typing import Any, List, Optional, Tuple, Dict
 import yaml
 from hackathon_api import Datapoint, Protein, SmallMolecule
 
+# Add torch for GPU memory management
+try:
+    import torch
+    TORCH_AVAILABLE = True
+except ImportError:
+    TORCH_AVAILABLE = False
+
 # Add src to path for importing verifiers
 project_root = Path(__file__).resolve().parent.parent
 src_path = project_root / 'src'
@@ -412,7 +419,8 @@ def prepare_protein_complex(datapoint_id: str, proteins: List[Protein], input_di
     configs = []
     for seed in range(16):  # seeds 0, 1, 2, 3
         cli_args = [
-            "--diffusion_samples", "4", 
+            "--diffusion_samples", "4",
+            "--max_parallel_samples", "1",
             "--seed", str(seed), 
             "--use_dropout",
             "--no-confidence-prediction",
@@ -510,42 +518,48 @@ def post_process_protein_complex_via_verifiers(datapoint: Datapoint, input_dicts
         print("Warning: No PDB files found for ranking")
         return []
 
-    print(f"Ranking {len(all_pdbs)} PDB files using multi-metric scoring...")
-    print(f"Using {max_workers} parallel workers for energy calculations...")
-    
-    # Calculate scores for each PDB in parallel
-    pdb_scores = []
-    
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        # Submit all tasks
-        future_to_pdb = {executor.submit(_calculate_all_metrics, pdb_path): pdb_path for pdb_path in all_pdbs}
+    try:
+        print(f"Ranking {len(all_pdbs)} PDB files using multi-metric scoring...")
+        print(f"Using {max_workers} parallel workers for energy calculations...")
         
-        # Collect results as they complete
-        for future in as_completed(future_to_pdb):
-            pdb_path = future_to_pdb[future]
-            try:
-                pdb_path_result, composite_score, metric_names = future.result()
-                pdb_scores.append((pdb_path_result, composite_score, metric_names))
-                
-                if metric_names:
-                    print(f"  ✓ {pdb_path.name}: score={composite_score:.4f} (metrics: {', '.join(metric_names)})")
-                else:
-                    print(f"  ⚠ {pdb_path.name}: score={composite_score:.4f} (no metrics available)")
+        # Calculate scores for each PDB in parallel
+        pdb_scores = []
+        
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            # Submit all tasks
+            future_to_pdb = {executor.submit(_calculate_all_metrics, pdb_path): pdb_path for pdb_path in all_pdbs}
+            
+            # Collect results as they complete
+            for future in as_completed(future_to_pdb):
+                pdb_path = future_to_pdb[future]
+                try:
+                    pdb_path_result, composite_score, metric_names = future.result()
+                    pdb_scores.append((pdb_path_result, composite_score, metric_names))
                     
-            except Exception as e:
-                print(f"  ✗ Error processing {pdb_path.name}: {e}")
-                # Add with default score
-                pdb_scores.append((pdb_path, 0.0, []))
-    
-    # Sort by composite score (descending - higher score is better)
-    pdb_scores.sort(key=lambda x: x[1], reverse=True)
-    
-    print(f"\nRanking results:")
-    for i, (pdb_path, score, metrics) in enumerate(pdb_scores):
-        print(f"  {i+1}. {pdb_path.name}: {score:.4f} ({', '.join(metrics)})")
-    
-    # Return sorted PDB paths
-    return [pdb_path for pdb_path, _, _ in pdb_scores]
+                    if metric_names:
+                        print(f"  ✓ {pdb_path.name}: score={composite_score:.4f} (metrics: {', '.join(metric_names)})")
+                    else:
+                        print(f"  ⚠ {pdb_path.name}: score={composite_score:.4f} (no metrics available)")
+                        
+                except Exception as e:
+                    print(f"  ✗ Error processing {pdb_path.name}: {e}")
+                    # Add with default score
+                    pdb_scores.append((pdb_path, -10000.0, []))
+        
+        # Sort by composite score (descending - higher score is better)
+        pdb_scores.sort(key=lambda x: x[1], reverse=True)
+        
+        print(f"\nRanking results:")
+        for i, (pdb_path, score, metrics) in enumerate(pdb_scores):
+            print(f"  {i+1}. {pdb_path.name}: {score:.4f} ({', '.join(metrics)})")
+        
+        # Return sorted PDB paths
+        return [pdb_path for pdb_path, _, _ in pdb_scores]
+
+    except Exception as e:
+        print(f"\nWARNING: An error occurred during ranking: {e}")
+        print("Returning all PDB files unsorted as a fallback.")
+        return all_pdbs
 
 def post_process_protein_ligand(datapoint: Datapoint, input_dicts: List[dict[str, Any]], cli_args_list: List[list[str]], prediction_dirs: List[Path]) -> List[Path]:
     """
@@ -682,26 +696,34 @@ def _run_boltz_and_collect(datapoint) -> None:
         with open(yaml_path, "w") as f:
             yaml.safe_dump(input_dict, f, sort_keys=False)
 
-        # Run boltz
-        cache = os.environ.get("BOLTZ_CACHE", str(Path.home() / ".boltz"))
-        fixed = [
-            "boltz", "predict", str(yaml_path),
-            "--devices", "1",
-            "--out_dir", str(out_dir),
-            "--cache", cache,
-            # "--no_kernels",
-            "--output_format", "pdb",
-        ]
-        cmd = fixed + cli_args
-        print(f"Running config {config_idx}:", " ".join(cmd), flush=True)
-        subprocess.run(cmd, check=True)
+        try:
+            # Run boltz
+            cache = os.environ.get("BOLTZ_CACHE", str(Path.home() / ".boltz"))
+            fixed = [
+                "boltz", "predict", str(yaml_path),
+                "--devices", "1",
+                "--out_dir", str(out_dir),
+                "--cache", cache,
+                "--no_kernels",
+                "--output_format", "pdb",
+            ]
+            cmd = fixed + cli_args
+            print(f"Running config {config_idx}:", " ".join(cmd), flush=True)
+            subprocess.run(cmd, check=True)
 
-        # Compute prediction subfolder for this config
-        pred_subfolder = out_dir / f"boltz_results_{datapoint.datapoint_id}_config_{config_idx}" / "predictions" / f"{datapoint.datapoint_id}_config_{config_idx}"
-        
-        all_input_dicts.append(input_dict)
-        all_cli_args.append(cli_args)
-        all_pred_subfolders.append(pred_subfolder)
+            # Compute prediction subfolder for this config
+            pred_subfolder = out_dir / f"boltz_results_{datapoint.datapoint_id}_config_{config_idx}" / "predictions" / f"{datapoint.datapoint_id}_config_{config_idx}"
+            
+            all_input_dicts.append(input_dict)
+            all_cli_args.append(cli_args)
+            all_pred_subfolders.append(pred_subfolder)
+        except subprocess.CalledProcessError as e:
+            print(f"WARNING: boltz predict failed for config {config_idx} with exit code {e.returncode}. Skipping.")
+            print(f"  Command: {' '.join(e.cmd)}")
+            continue
+        except Exception as e:
+            print(f"WARNING: An unexpected error occurred while running config {config_idx}: {e}. Skipping.")
+            continue
 
     # Post-process and copy submissions
     if datapoint.task_type == "protein_complex":
@@ -726,6 +748,12 @@ def _run_boltz_and_collect(datapoint) -> None:
             subprocess.run(["chmod", "-R", "g+rw", str(subdir)], check=True)
         except Exception as e:
             print(f"WARNING: Failed to set group ownership or permissions: {e}")
+
+    # Empty GPU memory and CUDA cache
+    if TORCH_AVAILABLE and torch.cuda.is_available():
+        print("Clearing CUDA cache...")
+        torch.cuda.empty_cache()
+        print("CUDA cache cleared.")
 
 def _load_datapoint(path: Path):
     """Load JSON datapoint file."""

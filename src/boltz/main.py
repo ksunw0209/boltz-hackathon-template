@@ -1073,7 +1073,7 @@ def cli() -> None:
     help="Whether to use superposition for the model. Default is True.",
 )
 @click.option(
-    "--no_trifast",
+    "--no_kernels",
     is_flag=True,
     help="Whether to not use trifast kernels for triangular updates. Default False",
 )
@@ -1167,7 +1167,7 @@ def predict(  # noqa: C901, PLR0915, PLR0912
     use_dropout: bool = False,
     s_z_samples: int = 1,
     no_superposition: bool = False,
-    no_trifast: bool = False,
+    no_kernels: bool = False,
     structure_ablation: bool = False,
     confidence_ablation: bool = False,
     confidence_ablation_all_gt: bool = False,
@@ -1197,10 +1197,10 @@ def predict(  # noqa: C901, PLR0915, PLR0912
     if seed is not None:
         seed_everything(seed)
 
-    # Set no_trifast=True when on CPU
+    # Set no_kernels=True when on CPU
     if accelerator == "cpu":
-        no_trifast = True
-    use_kernels = not no_trifast
+        no_kernels = True
+    use_kernels = not no_kernels
 
     # Set cache path
     cache = Path(cache).expanduser()

@@ -1,4 +1,5 @@
 import io
+import gc
 from openmm.app import ForceField, PDBFile, Modeller, NoCutoff, CutoffNonPeriodic, HBonds
 from pdbfixer import PDBFixer
 from openmm import LangevinIntegrator, Context, Platform
@@ -25,17 +26,23 @@ class OpenMMInteractionEnergy:
         system = self.forcefield.createSystem(topology, nonbondedMethod=NoCutoff, constraints=HBonds)
         integrator = LangevinIntegrator(300*kelvin, 1/picosecond, 0.002*picoseconds)
         integrator.setRandomNumberSeed(0)  # For deterministic results
-        if properties:
-            context = Context(system, integrator, platform, properties)
-        else:
-            context = Context(system, integrator, platform)
-        context.setPositions(positions)
-        state = context.getState(getEnergy=True, getForces=get_forces)
-        energy = state.getPotentialEnergy()
-        forces = None
-        if get_forces:
-            forces = state.getForces(asNumpy=True)
-        return energy, forces
+        context = None
+        try:
+            if properties:
+                context = Context(system, integrator, platform, properties)
+            else:
+                context = Context(system, integrator, platform)
+            context.setPositions(positions)
+            state = context.getState(getEnergy=True, getForces=get_forces)
+            energy = state.getPotentialEnergy()
+            forces = None
+            if get_forces:
+                forces = state.getForces(asNumpy=True)
+            return energy, forces
+        finally:
+            if context is not None:
+                del context
+                gc.collect()
 
     def calculate_interaction_energy(self, pdb_file_path, platform_name='CUDA', device_index=None, return_force=False, use_fixer=True):
         """
